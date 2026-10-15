@@ -53,3 +53,27 @@ pub const COPY_BODY: &str = "Copy body";
 pub const SEND_SHORTCUT_HINT: &str = "Send (Cmd/Ctrl+Enter)";
 pub const LONG_LINES_CLIPPED: &str =
     "Very long lines are clipped in this view; use Copy body for the full text.";
+
+pub const SAVING: &str = "Saving…";
+pub const HIGHLIGHT_OFF_LARGE: &str = "Highlighting off (large file)";
+pub const DISK_CHANGED: &str = "This file was changed by another program. Reload it (your unsaved changes will be lost) or keep your version.";
+pub const DISK_DELETED: &str = "This file was deleted or moved by another program. Your text is still here; save it to recreate the file.";
+pub const RELOAD: &str = "Reload";
+pub const KEEP_MINE: &str = "Keep my version";
+
+pub const FIND_HINT: &str = "Find";
+pub const REPLACE_HINT: &str = "Replace";
+pub const MATCH_CASE: &str = "Match case";
+pub const SEARCHING: &str = "Searching…";
+pub const NO_RESULTS: &str = "No results";
+pub const PREV_MATCH: &str = "Previous match (Shift+Enter, Shift+Cmd/Ctrl+G)";
+pub const NEXT_MATCH: &str = "Next match (Enter, Cmd/Ctrl+G)";
+pub const REPLACE: &str = "Replace";
+pub const REPLACE_ALL: &str = "Replace all";
+pub const CLOSE_FIND: &str = "Close (Esc)";
+pub const TOO_MANY_MATCHES: &str = "Only the first 100000 matches are found and replaced.";
+
+pub const RECOVERY_FOUND: &str =
+    "Unsaved changes from a previous session that did not close normally were found:";
+pub const RESTORE: &str = "Restore";
+pub const DISCARD: &str = "Discard";

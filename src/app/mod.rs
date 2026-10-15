@@ -1,44 +1,67 @@
 //! egui front end. Translates input into commands on the editor/HTTP models
 //! and presents their state. All slow work runs on background threads.
 
+mod docs;
+pub mod editor_view;
+mod find;
 mod http_view;
+mod jobs;
+mod recovery;
 pub mod strings;
 pub mod theme;
 mod view;
 
-use std::path::{Path, PathBuf};
+use std::ops::Range;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 
+pub use editor_view::EditorViewState;
+pub use find::FindState;
+use jobs::Jobs;
+use recovery::{RecoveryEvent, RecoveryWorker};
+
 use crate::cli::LaunchArgs;
-use crate::editor::document::{LONG_LINE_WARNING_BYTES, line_col};
-use crate::editor::{Document, SaveError};
+use crate::editor::Document;
 use crate::http::{
     ClientConfig, HttpError, HttpResponse, HttpService, Notify, RequestDraft, RequestId,
     ValidationError,
 };
+use crate::storage::recovery::{OrphanSession, default_root};
+use crate::syntax::{HighlightSpans, Lang, SyntaxService};
 use crate::workspace::Workspace;
 
 pub type TabKey = u64;
 
+/// Snapshot unsaved buffers for crash recovery after this much idle time.
+const RECOVERY_DELAY: Duration = Duration::from_millis(1500);
+/// Large documents are rewritten in full on every snapshot, so less often.
+const RECOVERY_DELAY_LARGE: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskNotice {
+    /// Modified by another program while this buffer has unsaved changes.
+    Changed,
+    /// Deleted or moved by another program.
+    Deleted,
+}
+
 pub struct DocTab {
     pub key: TabKey,
     pub doc: Document,
-    cursor_char: usize,
-    cursor_revision: u64,
-    pub line_col: (usize, usize),
-}
-
-impl DocTab {
-    fn update_cursor(&mut self, char_index: usize) {
-        if char_index != self.cursor_char || self.doc.revision() != self.cursor_revision {
-            self.cursor_char = char_index;
-            self.cursor_revision = self.doc.revision();
-            self.line_col = line_col(&self.doc.text, char_index);
-        }
-    }
+    pub view: EditorViewState,
+    pub lang: Option<Lang>,
+    /// `None` when highlighting is off (unknown language or large file).
+    pub highlight: Option<HighlightSpans>,
+    requested_highlight: Option<(u64, Range<usize>)>,
+    pub find: Option<FindState>,
+    pub saving: bool,
+    pub disk_notice: Option<DiskNotice>,
+    /// Revision last written to the recovery store (None = no entry).
+    recovery_written: Option<u64>,
+    last_edit: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,7 +73,7 @@ pub enum ResponsePane {
 pub struct ResponseView {
     pub response: HttpResponse,
     /// Byte ranges of each line of `response.body_text`.
-    pub lines: Vec<std::ops::Range<usize>>,
+    pub lines: Vec<Range<usize>>,
     /// Some line is longer than the view shows.
     pub has_long_lines: bool,
     pub pane: ResponsePane,
@@ -121,19 +144,34 @@ pub struct SimpleEditorApp {
     pub tabs: Vec<Tab>,
     pub active: Option<TabKey>,
     http: Option<HttpService>,
+    syntax: SyntaxService,
+    jobs: Jobs,
+    recovery: Option<RecoveryWorker>,
+    /// Sessions from previous runs with unsaved buffers, awaiting a decision.
+    pub orphans: Vec<OrphanSession>,
     pub notices: Vec<Notice>,
     pub dialog: Option<Dialog>,
     allow_close: bool,
     quit_requested: bool,
+    quit_after_saves: bool,
     next_key: TabKey,
     next_request_number: u32,
     pub theme_preference: egui::ThemePreference,
     startup_probe: Option<Instant>,
     frames: u64,
+    ctx: egui::Context,
+}
+
+/// Options that tests and tools may change.
+#[derive(Debug, Clone, Default)]
+pub struct AppOptions {
+    /// Where crash-recovery snapshots go; `None` uses the platform default.
+    pub recovery_root: Option<PathBuf>,
+    pub startup_probe: Option<Instant>,
 }
 
 impl SimpleEditorApp {
-    pub fn new(ctx: &egui::Context, launch: LaunchArgs, startup_probe: Option<Instant>) -> Self {
+    pub fn new(ctx: &egui::Context, launch: LaunchArgs, options: AppOptions) -> Self {
         theme::apply(ctx);
         let repaint_ctx = ctx.clone();
         let notify: Notify = Arc::new(move || repaint_ctx.request_repaint());
@@ -149,20 +187,36 @@ impl SimpleEditorApp {
                 None
             }
         };
+        let recovery = match options.recovery_root.or_else(default_root) {
+            Some(root) => Some(RecoveryWorker::start(&root, notify.clone())),
+            None => {
+                notices.push(Notice {
+                    is_error: true,
+                    text: "Crash recovery is unavailable: no data directory was found.".to_owned(),
+                });
+                None
+            }
+        };
         let mut app = Self {
-            workspace: Workspace::new(notify),
+            workspace: Workspace::new(notify.clone()),
             tabs: Vec::new(),
             active: None,
             http,
+            syntax: SyntaxService::new(notify.clone()),
+            jobs: Jobs::new(notify),
+            recovery,
+            orphans: Vec::new(),
             notices,
             dialog: None,
             allow_close: false,
             quit_requested: false,
+            quit_after_saves: false,
             next_key: 1,
             next_request_number: 1,
             theme_preference: egui::ThemePreference::System,
-            startup_probe,
+            startup_probe: options.startup_probe,
             frames: 0,
+            ctx: ctx.clone(),
         };
         if let Some(root) = launch.root {
             app.workspace.set_root(root);
@@ -186,19 +240,44 @@ impl SimpleEditorApp {
         });
     }
 
+    pub fn notice_info(&mut self, text: impl Into<String>) {
+        self.notices.push(Notice {
+            is_error: false,
+            text: text.into(),
+        });
+    }
+
     pub fn tab_index(&self, key: TabKey) -> Option<usize> {
         self.tabs.iter().position(|t| t.key() == key)
     }
 
-    fn doc_tab_mut(&mut self, key: TabKey) -> Option<&mut DocTab> {
+    pub fn doc_tab(&self, key: TabKey) -> Option<&DocTab> {
+        self.tabs.iter().find_map(|t| match t {
+            Tab::Doc(d) if d.key == key => Some(d.as_ref()),
+            _ => None,
+        })
+    }
+
+    pub fn doc_tab_mut(&mut self, key: TabKey) -> Option<&mut DocTab> {
         self.tabs.iter_mut().find_map(|t| match t {
             Tab::Doc(d) if d.key == key => Some(d.as_mut()),
             _ => None,
         })
     }
 
+    pub fn active_tab(&self) -> Option<&Tab> {
+        let key = self.active?;
+        self.tabs.iter().find(|t| t.key() == key)
+    }
+
     pub fn any_dirty(&self) -> bool {
         self.tabs.iter().any(Tab::is_dirty)
+    }
+
+    pub fn saves_in_flight(&self) -> bool {
+        self.tabs
+            .iter()
+            .any(|t| matches!(t, Tab::Doc(d) if d.saving))
     }
 
     /// Background work results; called every frame before drawing.
@@ -209,13 +288,44 @@ impl SimpleEditorApp {
                 Err(e) => self.notice_error(format!("Could not open {}: {e}.", path.display())),
             }
         }
+        for result in self.jobs.poll() {
+            self.on_job(result);
+        }
+        if let Some(recovery) = &self.recovery {
+            for event in recovery.poll() {
+                match event {
+                    RecoveryEvent::Orphans(found) => self.orphans.extend(found),
+                    RecoveryEvent::Failed(text) => self.notices.push(Notice {
+                        is_error: true,
+                        text,
+                    }),
+                }
+            }
+        }
+        for result in self.syntax.poll() {
+            for tab in &mut self.tabs {
+                if let Tab::Doc(d) = tab
+                    && d.doc.id() == result.doc
+                    && let Some(h) = d.highlight.as_mut()
+                {
+                    h.accept(result.revision, result.range.clone(), result.spans.clone());
+                }
+            }
+        }
+        self.poll_http();
+        self.sync_documents();
+    }
+
+    fn poll_http(&mut self) {
         let Some(http) = self.http.as_mut() else {
             return;
         };
         for event in http.poll() {
             // Only the latest request of a tab may update it.
             let tab = self.tabs.iter_mut().find_map(|t| match t {
-                Tab::Http(h) if matches!(h.state, HttpState::Sending { id, .. } if id == event.id) => {
+                Tab::Http(h)
+                    if matches!(h.state, HttpState::Sending { id, .. } if id == event.id) =>
+                {
                     Some(h)
                 }
                 _ => None,
@@ -229,53 +339,7 @@ impl SimpleEditorApp {
         }
     }
 
-    // ---- commands -------------------------------------------------------
-
-    pub fn open_path(&mut self, path: PathBuf) {
-        if let Some(key) = self.tabs.iter().find_map(|t| match t {
-            Tab::Doc(d) if d.doc.path() == Some(path.as_path()) => Some(d.key),
-            _ => None,
-        }) {
-            self.active = Some(key);
-            return;
-        }
-        self.workspace.request_open(path);
-    }
-
-    fn push_doc(&mut self, doc: Document) {
-        if let Some(path) = doc.path()
-            && let Some(key) = self.tabs.iter().find_map(|t| match t {
-                Tab::Doc(d) if d.doc.path() == Some(path) => Some(d.key),
-                _ => None,
-            })
-        {
-            self.active = Some(key);
-            return;
-        }
-        if doc.longest_line_at_open() > LONG_LINE_WARNING_BYTES {
-            self.notices.push(Notice {
-                is_error: false,
-                text: format!(
-                    "{} has a line of {} KiB; editing it may be slow in this preview build.",
-                    doc.display_name(),
-                    doc.longest_line_at_open() / 1024
-                ),
-            });
-        }
-        let key = self.alloc_key();
-        self.tabs.push(Tab::Doc(Box::new(DocTab {
-            key,
-            doc,
-            cursor_char: 0,
-            cursor_revision: 0,
-            line_col: (1, 1),
-        })));
-        self.active = Some(key);
-    }
-
-    pub fn new_file(&mut self) {
-        self.push_doc(Document::untitled());
-    }
+    // ---- HTTP -------------------------------------------------------------
 
     pub fn new_request(&mut self) {
         let key = self.alloc_key();
@@ -288,24 +352,6 @@ impl SimpleEditorApp {
             state: HttpState::Idle,
         })));
         self.active = Some(key);
-    }
-
-    pub fn open_file_dialog(&mut self) {
-        let mut dialog = rfd::FileDialog::new();
-        if let Some(root) = &self.workspace.root {
-            dialog = dialog.set_directory(root);
-        }
-        if let Some(paths) = dialog.pick_files() {
-            for path in paths {
-                self.open_path(path);
-            }
-        }
-    }
-
-    pub fn open_folder_dialog(&mut self) {
-        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-            self.workspace.set_root(dir);
-        }
     }
 
     pub fn send_request(&mut self, key: TabKey) {
@@ -337,6 +383,8 @@ impl SimpleEditorApp {
         }
     }
 
+    // ---- tabs and quitting -------------------------------------------------
+
     /// Asks to close a tab; unsaved documents ask for confirmation first.
     pub fn request_close_tab(&mut self, key: TabKey) {
         let Some(index) = self.tab_index(key) else {
@@ -354,10 +402,21 @@ impl SimpleEditorApp {
         let Some(index) = self.tab_index(key) else {
             return;
         };
-        if let Tab::Http(t) = &self.tabs[index]
-            && let (HttpState::Sending { id, .. }, Some(http)) = (&t.state, self.http.as_mut())
-        {
-            http.cancel(*id);
+        match &self.tabs[index] {
+            Tab::Http(t) => {
+                if let (HttpState::Sending { id, .. }, Some(http)) = (&t.state, self.http.as_mut())
+                {
+                    http.cancel(*id);
+                }
+            }
+            Tab::Doc(d) => {
+                self.syntax.close(d.doc.id());
+                if d.recovery_written.is_some()
+                    && let Some(r) = &self.recovery
+                {
+                    r.remove(d.key);
+                }
+            }
         }
         self.tabs.remove(index);
         if self.active == Some(key) {
@@ -369,70 +428,9 @@ impl SimpleEditorApp {
         }
     }
 
-    pub fn save_active(&mut self, choose_path: bool) {
-        if let Some(key) = self.active
-            && matches!(
-                self.tabs.get(self.tab_index(key).unwrap_or(usize::MAX)),
-                Some(Tab::Doc(_))
-            )
-        {
-            self.save_tab(key, choose_path, false, AfterSave::Nothing);
-        }
-    }
-
-    /// Saves a document tab and then runs `then`. Returns true if saved.
-    pub fn save_tab(
-        &mut self,
-        key: TabKey,
-        choose_path: bool,
-        overwrite: bool,
-        then: AfterSave,
-    ) -> bool {
-        let default_dir = self.workspace.root.clone();
-        let Some(tab) = self.doc_tab_mut(key) else {
-            return false;
-        };
-        let result = if choose_path || tab.doc.path().is_none() {
-            match pick_save_path(&tab.doc, default_dir.as_deref()) {
-                Some(path) => tab.doc.save_as(path),
-                None => return false,
-            }
-        } else if overwrite {
-            tab.doc.save_overwriting()
-        } else {
-            tab.doc.save()
-        };
-        let name = tab.doc.display_name();
-        match result {
-            Ok(()) => {
-                self.after_save(then);
-                true
-            }
-            Err(SaveError::ModifiedOnDisk) => {
-                self.active = Some(key);
-                self.dialog = Some(Dialog::Conflict { tab: key, then });
-                false
-            }
-            Err(SaveError::NoPath) => false,
-            Err(SaveError::Io(e)) => {
-                self.notice_error(format!(
-                    "Could not save {name}: {e}. The original file was not changed and your edits are still open."
-                ));
-                false
-            }
-        }
-    }
-
-    fn after_save(&mut self, then: AfterSave) {
-        match then {
-            AfterSave::Nothing => {}
-            AfterSave::CloseTab(key) => self.close_tab_now(key),
-            AfterSave::Quit => self.save_all_and_quit(),
-        }
-    }
-
-    /// Saves every modified document; quits only if all of them were saved.
+    /// Saves every modified document; quits once all of them are saved.
     pub fn save_all_and_quit(&mut self) {
+        self.quit_after_saves = true;
         let dirty: Vec<TabKey> = self
             .tabs
             .iter()
@@ -440,11 +438,18 @@ impl SimpleEditorApp {
             .map(Tab::key)
             .collect();
         for key in dirty {
-            if !self.save_tab(key, false, false, AfterSave::Nothing) {
+            if !self.save_tab(key, false, false, AfterSave::Quit) {
+                self.quit_after_saves = false;
                 return;
             }
         }
-        self.quit_now();
+        self.maybe_quit_after_saves();
+    }
+
+    fn maybe_quit_after_saves(&mut self) {
+        if self.quit_after_saves && !self.any_dirty() && !self.saves_in_flight() {
+            self.quit_now();
+        }
     }
 
     pub fn quit_now(&mut self) {
@@ -468,14 +473,13 @@ impl SimpleEditorApp {
         self.dialog = Some(Dialog::Quit);
         true
     }
-}
 
-fn pick_save_path(doc: &Document, default_dir: Option<&Path>) -> Option<PathBuf> {
-    let mut dialog = rfd::FileDialog::new().set_file_name(doc.display_name());
-    if let Some(dir) = doc.path().and_then(Path::parent).or(default_dir) {
-        dialog = dialog.set_directory(dir);
+    /// Clean shutdown: the user saved or discarded everything.
+    pub fn shutdown(&mut self) {
+        if let Some(r) = self.recovery.take() {
+            r.finish();
+        }
     }
-    dialog.save_file()
 }
 
 impl ResponseView {
@@ -495,7 +499,7 @@ impl ResponseView {
     }
 }
 
-fn line_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+fn line_ranges(text: &str) -> Vec<Range<usize>> {
     let mut ranges = Vec::new();
     let mut start = 0;
     for (i, b) in text.bytes().enumerate() {
@@ -512,6 +516,13 @@ fn line_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
 
 impl eframe::App for SimpleEditorApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if ctx.input(|i| {
+            i.events
+                .iter()
+                .any(|e| matches!(e, egui::Event::WindowFocused(true)))
+        }) {
+            self.check_disk_changes();
+        }
         self.poll();
         if ctx.input(|i| i.viewport().close_requested()) && self.on_close_requested() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -531,5 +542,11 @@ impl eframe::App for SimpleEditorApp {
             self.allow_close = true;
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
+    }
+
+    fn on_exit(&mut self) {
+        // Reached only after the close was allowed: everything was saved or
+        // explicitly discarded, so the recovery copies are no longer needed.
+        self.shutdown();
     }
 }

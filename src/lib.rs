@@ -4,6 +4,8 @@ pub mod app;
 pub mod cli;
 pub mod editor;
 pub mod http;
+pub mod storage;
+pub mod syntax;
 pub mod workspace;
 
 use std::process::ExitCode;
@@ -63,7 +65,10 @@ pub fn run(bin_name: &str) -> ExitCode {
             Ok(Box::new(app::SimpleEditorApp::new(
                 &cc.egui_ctx,
                 launch,
-                startup_probe,
+                app::AppOptions {
+                    recovery_root: None,
+                    startup_probe,
+                },
             )))
         }),
     );

@@ -24,10 +24,21 @@ tokio = { version = "1.53.3", features = ["rt-multi-thread", "time", "sync"] }
 rfd = { version = "0.17.2", default-features = false }
 tempfile = "3.27.0"
 url = "2.5.8"
+ropey = { version = "1.6.1", default-features = false, features = ["simd"] }
+unicode-segmentation = "1.13.3"
+tree-sitter = "0.27.1"
+tree-sitter-rust = "0.24.2"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-json = "0.24.8"
+tree-sitter-html = "0.23.2"
+tree-sitter-css = "0.25.0"
+streaming-iterator = "0.1.9"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 
 [dev-dependencies]
 tokio = { version = "1.53.3", features = ["rt-multi-thread", "time", "sync", "net", "io-util", "macros"] }
-ropey = "1.6.1"
 
 [profile.release]
 debug = "line-tables-only"

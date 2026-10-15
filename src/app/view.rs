@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui::{
     self, Align, Color32, Id, Key, KeyboardShortcut, Layout, Margin, Modifiers, RichText,
-    ScrollArea, TextEdit, ThemePreference, WidgetInfo, WidgetType,
+    ScrollArea, ThemePreference, WidgetInfo, WidgetType,
 };
 
 use super::strings as s;
@@ -17,6 +17,15 @@ const OPEN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::O)
 const CLOSE_TAB: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::W);
 const NEW_FILE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::N);
 const SEND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Enter);
+const FIND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::F);
+const REPLACE_MAC: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::ALT), Key::F);
+const REPLACE_OTHER: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::H);
+const FIND_PREV: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::G);
+const FIND_NEXT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::G);
+const F3_PREV: KeyboardShortcut = KeyboardShortcut::new(Modifiers::SHIFT, Key::F3);
+const F3_NEXT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::F3);
 
 enum Command {
     Save,
@@ -25,6 +34,13 @@ enum Command {
     CloseTab,
     NewFile,
     Send,
+    Find { replace: bool },
+    FindNext { backwards: bool },
+}
+
+/// Stable widget id of a document's editor (for focus).
+pub fn editor_id(key: TabKey) -> Id {
+    Id::new(("doc_edit", key))
 }
 
 impl SimpleEditorApp {
@@ -71,6 +87,8 @@ impl SimpleEditorApp {
 
     fn take_shortcuts(&self, ctx: &egui::Context) -> Vec<Command> {
         let http_active = matches!(self.active_tab(), Some(Tab::Http(_)));
+        let doc_active = matches!(self.active_tab(), Some(Tab::Doc(_)));
+        let mac = ctx.os() == egui::os::OperatingSystem::Mac;
         ctx.input_mut(|i| {
             let mut out = Vec::new();
             // Shift+Cmd+S first: plain Cmd+S would also match it logically.
@@ -92,6 +110,22 @@ impl SimpleEditorApp {
             if http_active && i.consume_shortcut(&SEND) {
                 out.push(Command::Send);
             }
+            if doc_active {
+                // Modified variants first: plain shortcuts match them logically.
+                if i.consume_shortcut(&REPLACE_MAC) || (!mac && i.consume_shortcut(&REPLACE_OTHER))
+                {
+                    out.push(Command::Find { replace: true });
+                }
+                if i.consume_shortcut(&FIND) {
+                    out.push(Command::Find { replace: false });
+                }
+                if i.consume_shortcut(&FIND_PREV) || i.consume_shortcut(&F3_PREV) {
+                    out.push(Command::FindNext { backwards: true });
+                }
+                if i.consume_shortcut(&FIND_NEXT) || i.consume_shortcut(&F3_NEXT) {
+                    out.push(Command::FindNext { backwards: false });
+                }
+            }
             out
         })
     }
@@ -112,12 +146,16 @@ impl SimpleEditorApp {
                     self.send_request(key);
                 }
             }
+            Command::Find { replace } => self.open_find(replace),
+            Command::FindNext { backwards } => {
+                if let Some(key) = self.active {
+                    if self.doc_tab(key).is_some_and(|t| t.find.is_none()) {
+                        self.open_find(false);
+                    }
+                    self.find_next(key, backwards);
+                }
+            }
         }
-    }
-
-    pub fn active_tab(&self) -> Option<&Tab> {
-        let key = self.active?;
-        self.tabs.iter().find(|t| t.key() == key)
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
@@ -180,21 +218,35 @@ impl SimpleEditorApp {
             match self.active_tab() {
                 Some(Tab::Doc(t)) => {
                     let f = t.doc.format();
+                    let sel = t.doc.selection();
+                    let (line, col) = t.doc.line_col(sel.head);
                     ui.label(secondary(t.doc.language().to_owned()));
+                    if t.lang.is_some() && t.highlight.is_none() {
+                        ui.label(
+                            RichText::new(s::HIGHLIGHT_OFF_LARGE)
+                                .color(p.warning)
+                                .small(),
+                        );
+                    }
                     ui.separator();
-                    ui.label(secondary(format!(
-                        "Ln {}, Col {}",
-                        t.line_col.0, t.line_col.1
-                    )));
+                    let mut pos = format!("Ln {}, Col {}", line + 1, col + 1);
+                    if !sel.is_empty() {
+                        pos.push_str(&format!(" ({} selected)", sel.end() - sel.start()));
+                    }
+                    ui.label(secondary(pos));
                     ui.separator();
-                    ui.label(secondary("Tab inserts \\t".to_owned()));
+                    ui.label(secondary(t.doc.indent().label()));
                     ui.separator();
                     ui.label(secondary(f.encoding_label().to_owned()));
                     ui.separator();
                     ui.label(secondary(f.line_ending.label().to_owned()));
-                    if t.doc.is_dirty() {
+                    if t.saving {
                         ui.separator();
-                        ui.label(secondary("Unsaved changes".to_owned()));
+                        ui.spinner();
+                        ui.label(secondary(s::SAVING.to_owned()));
+                    } else if t.doc.is_dirty() {
+                        ui.separator();
+                        ui.label(secondary(s::UNSAVED_TITLE.to_owned()));
                     }
                 }
                 Some(Tab::Http(_)) => {
@@ -353,31 +405,65 @@ impl SimpleEditorApp {
             return;
         };
         match &mut self.tabs[index] {
-            Tab::Doc(tab) => {
-                let output = ScrollArea::both()
-                    .id_salt(("doc_scroll", tab.key))
-                    .auto_shrink(false)
-                    .show(ui, |ui| {
-                        TextEdit::multiline(&mut tab.doc.text)
-                            .id(Id::new(("doc_edit", tab.key)))
-                            .code_editor()
-                            .lock_focus(true)
-                            .frame(egui::Frame::NONE)
-                            .margin(Margin::symmetric(12, 8))
-                            .desired_width(f32::INFINITY)
-                            .min_size(ui.available_size())
-                            .show(ui)
-                    })
-                    .inner;
-                if output.response.response.changed() {
-                    tab.doc.mark_edited();
-                }
-                if let Some(range) = output.cursor_range {
-                    tab.update_cursor(range.primary.index.0);
-                }
-            }
+            Tab::Doc(_) => self.doc_view(ui, key),
             Tab::Http(_) => self.http_tab(ui, key),
         }
+    }
+
+    fn doc_view(&mut self, ui: &mut egui::Ui, key: TabKey) {
+        let ctx = ui.ctx().clone();
+        let p = palette(&ctx);
+        // External change banner.
+        let notice = self.doc_tab(key).and_then(|t| t.disk_notice);
+        if let Some(notice) = notice {
+            let mut reload = false;
+            let mut keep = false;
+            egui::Frame::NONE
+                .fill(p.warning.gamma_multiply(0.12))
+                .inner_margin(Margin::symmetric(12, 6))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        let text = match notice {
+                            super::DiskNotice::Changed => s::DISK_CHANGED,
+                            super::DiskNotice::Deleted => s::DISK_DELETED,
+                        };
+                        ui.label(RichText::new("⚠").color(p.warning));
+                        ui.label(RichText::new(text).color(p.text));
+                        if notice == super::DiskNotice::Changed && ui.button(s::RELOAD).clicked() {
+                            reload = true;
+                        }
+                        if ui.button(s::KEEP_MINE).clicked() {
+                            keep = true;
+                        }
+                    });
+                });
+            if reload {
+                self.reload_tab(key);
+            }
+            if keep {
+                self.keep_mine(key);
+            }
+        }
+        if self.doc_tab(key).is_some_and(|t| t.find.is_some()) {
+            self.find_bar(ui, key);
+        }
+        let dark = ctx.theme() == egui::Theme::Dark;
+        let Some(tab) = self.doc_tab_mut(key) else {
+            return;
+        };
+        let (matches, current) = match &tab.find {
+            Some(f) if !f.query.is_empty() => (f.matches.clone(), f.current),
+            _ => (Vec::new(), None),
+        };
+        let input = super::editor_view::EditorInput {
+            id: editor_id(key),
+            palette: p,
+            dark,
+            highlight: tab.highlight.as_ref(),
+            matches: &matches,
+            current_match: current,
+        };
+        super::editor_view::show(ui, &mut tab.doc, &mut tab.view, input);
     }
 
     fn tab_strip(&mut self, ui: &mut egui::Ui) {
@@ -477,7 +563,41 @@ impl SimpleEditorApp {
         });
     }
 
+    fn recovery_bar(&mut self, ui: &mut egui::Ui) {
+        if self.orphans.is_empty() {
+            return;
+        }
+        let p = palette(ui.ctx());
+        let names: Vec<String> = self
+            .orphans
+            .iter()
+            .flat_map(|s| s.entries.iter().map(|e| e.meta.display_name.clone()))
+            .collect();
+        let (mut restore, mut discard) = (false, false);
+        egui::Frame::NONE
+            .fill(p.action.gamma_multiply(0.10))
+            .stroke(egui::Stroke::new(1.0, p.action))
+            .corner_radius(theme::RADIUS)
+            .inner_margin(Margin::symmetric(12, 6))
+            .outer_margin(Margin::symmetric(8, 4))
+            .show(ui, |ui| {
+                ui.label(RichText::new(s::RECOVERY_FOUND).strong().color(p.text));
+                ui.label(RichText::new(names.join(", ")).color(p.text));
+                ui.horizontal(|ui| {
+                    restore = ui.add(primary_button(ui.ctx(), s::RESTORE)).clicked();
+                    discard = ui.button(s::DISCARD).clicked();
+                });
+            });
+        if restore {
+            self.restore_orphans();
+        }
+        if discard {
+            self.discard_orphans();
+        }
+    }
+
     fn notices_bar(&mut self, ui: &mut egui::Ui) {
+        self.recovery_bar(ui);
         if self.notices.is_empty() {
             return;
         }
