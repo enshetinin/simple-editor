@@ -5,8 +5,8 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use tokio::runtime::Runtime;
 use tokio::task::AbortHandle;
 
-use super::client::{ClientConfig, HttpError, HttpResponse, build_client, execute};
-use super::request::PreparedRequest;
+use super::client::{BodySink, ClientConfig, HttpError, HttpResponse, build_client, execute};
+use super::resolve::ResolvedRequest;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RequestId(u64);
@@ -59,7 +59,12 @@ impl HttpService {
     }
 
     /// Starts a request. The result arrives later through [`Self::poll`].
-    pub fn send(&mut self, request: PreparedRequest) -> RequestId {
+    pub fn send(&mut self, request: ResolvedRequest) -> RequestId {
+        self.send_to(request, BodySink::Preview)
+    }
+
+    /// Starts a request whose body goes to `sink`.
+    pub fn send_to(&mut self, request: ResolvedRequest, sink: BodySink) -> RequestId {
         let id = RequestId(self.next_id);
         self.next_id += 1;
         let client = self.client.clone();
@@ -67,7 +72,7 @@ impl HttpService {
         let notify = Arc::clone(&self.notify);
         let limit = self.config.preview_limit;
         let handle = self.runtime.spawn(async move {
-            let result = execute(&client, request, limit).await;
+            let result = execute(&client, request, sink, limit).await;
             // The receiver only disappears when the app is shutting down.
             let _ = tx.send(HttpEvent { id, result });
             notify();

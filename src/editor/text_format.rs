@@ -3,7 +3,9 @@
 //! Supported on-disk format in H0: UTF-8, with or without BOM. Anything else is
 //! rejected explicitly instead of being converted silently.
 
+use std::borrow::Cow;
 use std::fmt;
+use std::io::{self, Write};
 
 const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
 
@@ -109,38 +111,45 @@ fn classify_and_normalize(text: &str) -> (LineEnding, String) {
     }
 }
 
-/// Encodes editor text using the format it was loaded with.
+/// Normalizes text entering the buffer (typing, paste) so a LF/CRLF document
+/// only ever holds `\n`. Mixed documents keep the exact characters.
+pub fn normalize_input(text: &str, line_ending: LineEnding) -> Cow<'_, str> {
+    if line_ending == LineEnding::Mixed || !text.contains('\r') {
+        return Cow::Borrowed(text);
+    }
+    Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
+}
+
+/// Writes buffer chunks to `out` using the format the file was loaded with.
+pub fn encode_to<'a, W: Write + ?Sized>(
+    chunks: impl Iterator<Item = &'a str>,
+    format: &TextFormat,
+    out: &mut W,
+) -> io::Result<()> {
+    if format.bom {
+        out.write_all(UTF8_BOM)?;
+    }
+    for chunk in chunks {
+        match format.line_ending {
+            LineEnding::Lf | LineEnding::Mixed => out.write_all(chunk.as_bytes())?,
+            LineEnding::Crlf => {
+                let mut rest = chunk.as_bytes();
+                while let Some(pos) = rest.iter().position(|&b| b == b'\n') {
+                    out.write_all(&rest[..pos])?;
+                    out.write_all(b"\r\n")?;
+                    rest = &rest[pos + 1..];
+                }
+                out.write_all(rest)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Encodes a whole string (convenience for tests and small buffers).
 pub fn encode(text: &str, format: &TextFormat) -> Vec<u8> {
     let mut out = Vec::with_capacity(text.len() + text.len() / 32 + UTF8_BOM.len());
-    if format.bom {
-        out.extend_from_slice(UTF8_BOM);
-    }
-    match format.line_ending {
-        LineEnding::Mixed => out.extend_from_slice(text.as_bytes()),
-        LineEnding::Lf => {
-            // A paste may have introduced `\r\n`; keep the document consistently LF.
-            if text.contains('\r') {
-                out.extend_from_slice(text.replace("\r\n", "\n").as_bytes());
-            } else {
-                out.extend_from_slice(text.as_bytes());
-            }
-        }
-        LineEnding::Crlf => {
-            let normalized;
-            let text = if text.contains('\r') {
-                normalized = text.replace("\r\n", "\n");
-                normalized.as_str()
-            } else {
-                text
-            };
-            for (i, line) in text.split('\n').enumerate() {
-                if i > 0 {
-                    out.extend_from_slice(b"\r\n");
-                }
-                out.extend_from_slice(line.as_bytes());
-            }
-        }
-    }
+    encode_to(std::iter::once(text), format, &mut out).expect("writing to a Vec cannot fail");
     out
 }
 
@@ -176,8 +185,23 @@ mod tests {
         let (mut text, format) = decode(b"one\r\ntwo").unwrap();
         assert_eq!(text, "one\ntwo");
         text.push_str("\nthree");
-        text.push_str("\r\nfour"); // pasted CRLF
-        assert_eq!(encode(&text, &format), b"one\r\ntwo\r\nthree\r\nfour");
+        text.push_str(&normalize_input("\r\nfour\rfive", format.line_ending)); // pasted
+        assert_eq!(
+            encode(&text, &format),
+            b"one\r\ntwo\r\nthree\r\nfour\r\nfive"
+        );
+        assert_eq!(normalize_input("a\r\nb", LineEnding::Mixed), "a\r\nb");
+    }
+
+    #[test]
+    fn crlf_encoding_across_chunk_boundaries() {
+        let format = TextFormat {
+            bom: false,
+            line_ending: LineEnding::Crlf,
+        };
+        let mut out = Vec::new();
+        encode_to(["a\n", "\nb", "c\n"].into_iter(), &format, &mut out).unwrap();
+        assert_eq!(out, b"a\r\n\r\nbc\r\n");
     }
 
     #[test]

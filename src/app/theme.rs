@@ -117,3 +117,84 @@ pub fn primary_button(ctx: &egui::Context, text: &str) -> egui::Button<'static> 
         .fill(p.action)
         .corner_radius(CornerRadius::same(RADIUS))
 }
+
+/// Syntax colors per theme. Checked for WCAG AA contrast (≥ 4.5:1) against
+/// the editor surface in tests.
+pub fn syntax_color(p: &Palette, hl: crate::syntax::Hl, dark: bool) -> Color32 {
+    use crate::syntax::Hl;
+    let rgb = |l: u32, d: u32| {
+        let v = if dark { d } else { l };
+        Color32::from_rgb((v >> 16) as u8, (v >> 8) as u8, v as u8)
+    };
+    match hl {
+        Hl::None => p.text,
+        Hl::Keyword | Hl::VariableBuiltin => rgb(0x6E5DC6, 0xB8ACF6),
+        Hl::String => rgb(0x216E4E, 0x7EE2B8),
+        Hl::Escape | Hl::Number | Hl::Constant | Hl::Attribute => rgb(0xA54800, 0xFEC57B),
+        Hl::Comment => rgb(0x626F86, 0x8C9BAB),
+        Hl::Function | Hl::Label => rgb(0x0055CC, 0x85B8FF),
+        Hl::Type => rgb(0x206A83, 0x9DD9EE),
+        Hl::Property => rgb(0x44546F, 0xB6C2CF),
+        Hl::Operator | Hl::Punctuation => p.text_secondary,
+        Hl::Tag => rgb(0xAE2E24, 0xFD9891),
+    }
+}
+
+/// WCAG relative-luminance contrast ratio.
+pub fn contrast(a: Color32, b: Color32) -> f32 {
+    fn lum(c: Color32) -> f32 {
+        let ch = |v: u8| {
+            let v = v as f32 / 255.0;
+            if v <= 0.03928 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * ch(c.r()) + 0.7152 * ch(c.g()) + 0.0722 * ch(c.b())
+    }
+    let (la, lb) = (lum(a), lum(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::syntax::Hl;
+
+    #[test]
+    fn text_and_syntax_colors_meet_aa_contrast() {
+        let all = [
+            Hl::None,
+            Hl::Keyword,
+            Hl::String,
+            Hl::Escape,
+            Hl::Comment,
+            Hl::Number,
+            Hl::Function,
+            Hl::Type,
+            Hl::Property,
+            Hl::Operator,
+            Hl::Tag,
+        ];
+        for (p, dark) in [(&LIGHT, false), (&DARK, true)] {
+            for bg in [p.surface, p.background] {
+                for hl in all {
+                    let c = contrast(syntax_color(p, hl, dark), bg);
+                    assert!(c >= 4.5, "{hl:?} dark={dark}: {c:.2}");
+                }
+                for (name, fg) in [
+                    ("text", p.text),
+                    ("secondary", p.text_secondary),
+                    ("action", p.action),
+                    ("error", p.error),
+                    ("warning", p.warning),
+                    ("success", p.success),
+                ] {
+                    let c = contrast(fg, bg);
+                    assert!(c >= 4.5, "{name} dark={dark}: {c:.2}");
+                }
+            }
+        }
+    }
+}

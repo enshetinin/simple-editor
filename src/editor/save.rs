@@ -33,10 +33,18 @@ fn resolve_target(path: &Path) -> io::Result<PathBuf> {
 }
 
 /// Atomically replaces (or creates) `path` with `bytes`.
+pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    atomic_write_with(path, |w| w.write_all(bytes))
+}
+
+/// Atomically replaces (or creates) `path` with what `write` produces.
 ///
 /// If any step fails the original file is left untouched and the temporary
 /// file is removed.
-pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub fn atomic_write_with(
+    path: &Path,
+    write: impl FnOnce(&mut dyn Write) -> io::Result<()>,
+) -> io::Result<()> {
     let target = resolve_target(path)?;
     let dir = match target.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
@@ -44,12 +52,13 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     };
     let existing_permissions = fs::metadata(&target).ok().map(|m| m.permissions());
 
-    let mut tmp = tempfile::Builder::new()
+    let tmp = tempfile::Builder::new()
         .prefix(".se-save-")
         .suffix(".tmp")
         .tempfile_in(dir)?;
-    tmp.write_all(bytes)?;
-    tmp.flush()?;
+    let mut writer = io::BufWriter::with_capacity(256 * 1024, tmp);
+    write(&mut writer)?;
+    let tmp = writer.into_inner().map_err(|e| e.into_error())?;
     if let Some(perms) = existing_permissions {
         fs::set_permissions(tmp.path(), perms)?;
     }

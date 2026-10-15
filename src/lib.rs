@@ -4,6 +4,9 @@ pub mod app;
 pub mod cli;
 pub mod editor;
 pub mod http;
+pub mod install;
+pub mod storage;
+pub mod syntax;
 pub mod workspace;
 
 use std::process::ExitCode;
@@ -31,6 +34,10 @@ pub fn run(bin_name: &str) -> ExitCode {
             println!("SimpleEditor {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
         }
+        CliAction::InstallCli { name, dir } => return install_cli(bin_name, &name, dir, true),
+        CliAction::UninstallCli { name, dir } => {
+            return install_cli(bin_name, &name, dir, false);
+        }
         CliAction::Error(message) => {
             eprintln!("{bin_name}: {message}");
             return ExitCode::from(2);
@@ -53,7 +60,12 @@ pub fn run(bin_name: &str) -> ExitCode {
             .with_title(title)
             .with_app_id("simpleeditor")
             .with_inner_size([1200.0, 780.0])
-            .with_min_inner_size([960.0, 640.0]),
+            .with_min_inner_size([960.0, 640.0])
+            .with_icon(std::sync::Arc::new(eframe::egui::IconData {
+                rgba: include_bytes!("../assets/icon/icon-64.rgba").to_vec(),
+                width: 64,
+                height: 64,
+            })),
         ..Default::default()
     };
     let result = eframe::run_native(
@@ -63,7 +75,10 @@ pub fn run(bin_name: &str) -> ExitCode {
             Ok(Box::new(app::SimpleEditorApp::new(
                 &cc.egui_ctx,
                 launch,
-                startup_probe,
+                app::AppOptions {
+                    startup_probe,
+                    ..app::AppOptions::default()
+                },
             )))
         }),
     );
@@ -71,6 +86,43 @@ pub fn run(bin_name: &str) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("{bin_name}: could not start the window: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn install_cli(bin_name: &str, name: &str, dir: Option<std::path::PathBuf>, add: bool) -> ExitCode {
+    let Some(dir) = dir.or_else(install::default_dir) else {
+        eprintln!("{bin_name}: no default folder found; pass --dir");
+        return ExitCode::from(2);
+    };
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("{bin_name}: cannot locate this executable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let result = if add {
+        install::install(&dir, name, &exe).map(|outcome| match outcome {
+            install::InstallOutcome::Installed(p) => format!("Installed {}", p.display()),
+            install::InstallOutcome::AlreadyInstalled(p) => {
+                format!("Already installed: {}", p.display())
+            }
+        })
+    } else {
+        install::uninstall(&dir, name, &exe).map(|p| format!("Removed {}", p.display()))
+    };
+    match result {
+        Ok(msg) => {
+            println!("{msg}");
+            if add && !install::dir_in_path(&dir) {
+                println!("{}", install::path_hint(&dir));
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{bin_name}: {e}");
             ExitCode::FAILURE
         }
     }
