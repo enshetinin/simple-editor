@@ -9,6 +9,7 @@ mod http_app;
 mod http_view;
 mod jobs;
 mod recovery;
+mod session;
 pub mod strings;
 pub mod theme;
 mod view;
@@ -150,6 +151,13 @@ pub struct SimpleEditorApp {
     pub project: Option<ProjectState>,
     pub history: Vec<HistoryEntry>,
     user_state: UserState,
+    /// History/state were read (or found missing); writes wait for this.
+    user_data_loaded: bool,
+    /// A write was requested before the user data finished loading.
+    user_data_dirty: bool,
+    /// Project whose last session should be restored once loaded.
+    pending_restore: Option<PathBuf>,
+    restore: Option<session::RestoreState>,
     data_dir: Option<PathBuf>,
     secrets: Arc<dyn SecretBackend>,
     /// Limit for "Send and save to file", in MiB (session setting).
@@ -227,6 +235,10 @@ impl SimpleEditorApp {
             project: None,
             history: Vec::new(),
             user_state: UserState::default(),
+            user_data_loaded: false,
+            user_data_dirty: false,
+            pending_restore: None,
+            restore: None,
             data_dir,
             secrets: options.secrets.unwrap_or_else(default_backend),
             download_limit_mib: crate::http::client::DEFAULT_DOWNLOAD_LIMIT / (1024 * 1024),
@@ -242,7 +254,14 @@ impl SimpleEditorApp {
             frames: 0,
             ctx: ctx.clone(),
         };
+        if app.data_dir.is_none() {
+            app.user_data_loaded = true;
+        }
         if let Some(root) = launch.root {
+            // `se .` restores the folder's last session; `se file` does not.
+            if launch.files.is_empty() {
+                app.pending_restore = Some(root.clone());
+            }
             app.open_folder(root);
         }
         for file in launch.files {
@@ -361,6 +380,7 @@ impl SimpleEditorApp {
         }
         self.poll_http();
         self.sync_documents();
+        self.maybe_restore_session();
     }
 
     // ---- tabs and quitting -------------------------------------------------
@@ -483,6 +503,7 @@ impl SimpleEditorApp {
 
     /// Clean shutdown: the user saved or discarded everything.
     pub fn shutdown(&mut self) {
+        self.save_session_blocking();
         if let Some(r) = self.recovery.take() {
             r.finish();
         }

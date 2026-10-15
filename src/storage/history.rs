@@ -95,14 +95,44 @@ pub fn push(entries: &mut Vec<HistoryEntry>, entry: HistoryEntry) {
     entries.truncate(MAX_ENTRIES);
 }
 
-/// Small per-user state (e.g. the active environment of each project).
+/// Small per-user state: active environment and open tabs of each project,
+/// theme preference.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserState {
     pub schema_version: u32,
     /// Project root (as displayed) → active environment id.
     #[serde(default)]
     pub active_environment: BTreeMap<String, String>,
+    /// "system", "light" or "dark".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<String>,
+    /// Project root (as displayed) → tabs open when the app was closed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sessions: BTreeMap<String, ProjectSession>,
 }
+
+/// Tabs of a project, restored when the same folder is opened again.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectSession {
+    #[serde(default)]
+    pub tabs: Vec<SessionTab>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum SessionTab {
+    /// An open file and its cursor (char index).
+    File { path: PathBuf, cursor: usize },
+    /// A request saved in a collection.
+    Saved { collection: String, request: String },
+    /// An unsaved request, sanitized (no literal credentials).
+    Draft { request: RequestDefinition },
+}
+
+/// Most projects remembered in `sessions`; the oldest entries are dropped.
+pub const MAX_SESSIONS: usize = 50;
 
 pub fn state_path(data_dir: &Path) -> PathBuf {
     data_dir.join("state.json")
@@ -160,6 +190,23 @@ mod tests {
         let sp = state_path(dir.path());
         let mut st = load_state(&sp);
         st.active_environment.insert("/p".into(), "local".into());
+        st.theme = Some("dark".into());
+        st.sessions.insert(
+            "/p".into(),
+            ProjectSession {
+                tabs: vec![
+                    SessionTab::File {
+                        path: "/p/a.rs".into(),
+                        cursor: 3,
+                    },
+                    SessionTab::Saved {
+                        collection: "c".into(),
+                        request: "r".into(),
+                    },
+                ],
+                active: Some(1),
+            },
+        );
         save_state(&sp, &st).unwrap();
         assert_eq!(load_state(&sp), st);
     }

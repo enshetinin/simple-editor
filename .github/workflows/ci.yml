@@ -31,6 +31,42 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Tests
+        env:
+          # Never touch the runner's real credential store.
+          SE_SECRET_BACKEND: memory
         run: cargo test --locked --all-targets --all-features
       - name: Release build
         run: cargo build --locked --release --bins
+      - name: Third-party licenses are up to date
+        if: runner.os == 'macOS'
+        run: python3 scripts/third_party_licenses.py --check
+
+  package:
+    name: package-${{ matrix.os }}
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: ./scripts/package-macos.sh
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/package-windows.ps1
+      # Workflow artifacts only: nothing is published as a release.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: simpleeditor-${{ runner.os }}
+          path: |
+            dist/*.zip
+            dist/*.dmg
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 14

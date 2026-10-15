@@ -26,6 +26,9 @@ const FIND_PREV: KeyboardShortcut =
 const FIND_NEXT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::G);
 const F3_PREV: KeyboardShortcut = KeyboardShortcut::new(Modifiers::SHIFT, Key::F3);
 const F3_NEXT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::F3);
+const PREV_TAB: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::Tab);
+const NEXT_TAB: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::Tab);
 
 enum Command {
     Save,
@@ -36,6 +39,7 @@ enum Command {
     Send,
     Find { replace: bool },
     FindNext { backwards: bool },
+    SwitchTab { backwards: bool },
 }
 
 /// Stable widget id of a document's editor (for focus).
@@ -47,6 +51,22 @@ impl SimpleEditorApp {
     /// Draws the whole window. Separate from `eframe::App` so it can run headless in tests.
     pub fn draw(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        // Files or folders dropped on the window (Finder, Explorer).
+        let dropped: Vec<std::path::PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .map(|f| f.path().to_path_buf())
+                .filter(|p| !p.as_os_str().is_empty())
+                .collect()
+        });
+        for path in dropped {
+            if path.is_dir() {
+                self.open_folder(path);
+            } else {
+                self.open_path(path);
+            }
+        }
         if self.dialog.is_none() {
             for command in self.take_shortcuts(&ctx) {
                 self.run_command(command);
@@ -107,6 +127,11 @@ impl SimpleEditorApp {
             if i.consume_shortcut(&NEW_FILE) {
                 out.push(Command::NewFile);
             }
+            if i.consume_shortcut(&PREV_TAB) {
+                out.push(Command::SwitchTab { backwards: true });
+            } else if i.consume_shortcut(&NEXT_TAB) {
+                out.push(Command::SwitchTab { backwards: false });
+            }
             if http_active && i.consume_shortcut(&SEND) {
                 out.push(Command::Send);
             }
@@ -155,6 +180,23 @@ impl SimpleEditorApp {
                 }
             }
             Command::Find { replace } => self.open_find(replace),
+            Command::SwitchTab { backwards } => {
+                let n = self.tabs.len();
+                if let Some(i) = self.active.and_then(|k| self.tab_index(k))
+                    && n > 1
+                {
+                    let next = if backwards {
+                        (i + n - 1) % n
+                    } else {
+                        (i + 1) % n
+                    };
+                    let key = self.tabs[next].key();
+                    self.active = Some(key);
+                    if matches!(self.tabs[next], Tab::Doc(_)) {
+                        self.ctx.memory_mut(|m| m.request_focus(editor_id(key)));
+                    }
+                }
+            }
             Command::FindNext { backwards } => {
                 if let Some(key) = self.active {
                     if self.doc_tab(key).is_some_and(|t| t.find.is_none()) {
@@ -204,8 +246,7 @@ impl SimpleEditorApp {
                     ThemePreference::Dark => (s::THEME_DARK, ThemePreference::System),
                 };
                 if ui.button(label).clicked() {
-                    self.theme_preference = next;
-                    ui.ctx().set_theme(next);
+                    self.set_theme_preference(next);
                 }
                 let can_save = self.active_tab().is_some();
                 if ui
@@ -455,6 +496,7 @@ impl SimpleEditorApp {
             Some(f) if !f.query.is_empty() => (f.matches.clone(), f.current),
             _ => (Vec::new(), None),
         };
+        let name = tab.doc.display_name();
         let input = super::editor_view::EditorInput {
             id: editor_id(key),
             palette: p,
@@ -462,6 +504,7 @@ impl SimpleEditorApp {
             highlight: tab.highlight.as_ref(),
             matches: &matches,
             current_match: current,
+            name: &name,
         };
         super::editor_view::show(ui, &mut tab.doc, &mut tab.view, input);
     }

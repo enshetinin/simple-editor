@@ -1,5 +1,68 @@
 # Estado de SimpleEditor
 
+Actualizado: 2026-10-15 — cierre de **H3** (pulido y distribución), **sin publicar**.
+Base: `91a521a` (H2) + cambios de H3 **sin commit**. `develop` va 2 commits por delante de `origin`: H1, H2 y H3 **no se han probado en Windows**, porque la CI solo corre tras el push. No he hecho commit, push, tag ni release.
+
+## H3 — resumen
+| Área | Estado |
+|---|---|
+| CLI instalable (`se --install-cli`, `--uninstall-cli`, `--name`, `--dir`) | PASS (unitarias + binario real: instala, detecta la reinstalación, no toca un comando ajeno y desinstala solo lo suyo) |
+| Windows: `simpleeditor.exe` gráfico sin consola, `se.exe` CLI | Implementado; NOT RUN (sin Windows) |
+| Restauración de sesión (archivos + cursor, peticiones, borradores saneados, pestaña activa) y tema persistente | PASS (`tests/session.rs`, dos arranques de la app sin ventana) |
+| Arrastrar y soltar archivos o carpetas sobre la ventana | Implementado; NOT RUN (manual) |
+| Accesibilidad: el editor expone la línea actual y la posición a AccessKit | PASS (prueba con AccessKit activado). VoiceOver/Narrador reales: NOT RUN |
+| Teclado: Ctrl+Tab / Ctrl+Shift+Tab | PASS (prueba) |
+| Layout a 960×640 al 100/150/200 % (editor, entornos, 6 sub-pestañas HTTP) | PASS (prueba: nada se sale de la ventana). Corregido un desbordamiento de 5 px en la fila de la URL |
+| Icono propio (`scripts/make_icon.py`, sin dependencias): PNG, ICO, icns y icono de ventana | Hecho, revisado visualmente |
+| Paquete macOS (`scripts/package-macos.sh`) | PASS en local: `.app` arm64, macOS ≥ 11.0 (leído del binario), zip, DMG y sha256 verificados; firma ad-hoc válida; arranca por LaunchServices. **Gatekeeper: rejected** (falta Developer ID/notarización, credenciales tuyas) |
+| Paquete Windows (`scripts/package-windows.ps1`, zip portable) | NOT RUN en local; lo ejecuta el job `package` de la CI (artefactos de 14 días, sin publicar) |
+| Licencias de terceros (`THIRD_PARTY_LICENSES.md`, 318 crates + fuentes embebidas) | PASS (`--check` en la CI de macOS). Hay 41 crates sin archivo de licencia en su paquete; se usan bajo una licencia de su expresión SPDX y su texto canónico está en `scripts/license-texts/` |
+| CONTRIBUTING, SECURITY, CHANGELOG, `docs/RELEASE.md` | Hecho. El canal de seguridad y el código de conducta quedan pendientes de tu decisión |
+| Optimización medida | Av Pág en una línea de 1 MiB: 3,4 ms → 0,01 ms (columna visual sin recorrido en líneas largas) |
+
+## Comandos ejecutados (macOS, Apple M3, rustc 1.99.0)
+| Comando | Resultado |
+|---|---|
+| `cargo fmt --check` | PASS |
+| `cargo clippy --locked --all-targets --all-features -- -D warnings` | PASS |
+| `cargo test --locked --all-targets --all-features` | PASS: **106 pruebas**, 3 ejecuciones seguidas (1 ignorada) |
+| `cargo test --test save -- --ignored` | PASS (disco lleno real) |
+| `python3 scripts/third_party_licenses.py --check` | PASS |
+| `./scripts/package-macos.sh` | PASS (ver arriba); `shasum -c` OK. `hdiutil` avisa de que está obsoleto en macOS 27, pero funciona |
+| `spctl --assess` sobre el `.app` | rejected (esperado sin firma Developer ID ni notarización) |
+
+## Métricas finales (release)
+- **Editor** (`editor_probe --100mib`): tecleo p95 0,09–0,14 ms en todos los corpus, incluido 100 MiB; Av Pág p95 ≤ 0,19 ms (también la línea única de 1 MiB tras la optimización); operaciones del motor ≈ 1 µs; reparseo incremental p50 1,83 ms (1 MiB) y 27,5 ms (8 MiB) en el worker; abrir/guardar 100 MiB en 126/91 ms en worker; JSON de 5 MiB procesado en ≈ 26 ms en worker.
+- **Arranque en caliente** (`se .`, 19 ejecuciones tras la primera, que tardó 680 ms): p50 94,5 ms, p95 118,9 ms, máx. 119,4 ms. Objetivo < 500 ms: PASS.
+- **Reposo**:
+  - **0,00 % sin eventos de entrada** (4 ventanas seguidas de 10 s con 0 frames);
+  - con actividad del ratón sobre la ventana, la CPU sigue a los frames dibujados (79 frames ≈ 5,1 % en 10 s);
+  - en dos mediciones de 60 s con el equipo en uso salió 3,2 % y 1,7 %; al registrar los eventos, los frames eran `PointerMoved`/`MouseMoved`/clics/foco, no repintado propio.
+
+  Conclusión: no hay repintado continuo. Repite la medida sin tocar el ratón para la cifra oficial (checklist).
+- **Memoria** (`se .`): RSS 89,0 MiB, footprint 61 MB; con un archivo abierto y resaltado: RSS 106,7 MiB. Objetivo < 150 MiB: PASS.
+
+## Decisiones de H3
+- `se --install-cli` crea un symlink (macOS) o un shim `.cmd` (Windows) en una carpeta de usuario. No modifica el PATH: solo imprime cómo añadirla. Nunca reemplaza un archivo que no creó y ofrece `simpleeditor` como nombre alternativo.
+- La sesión se guarda en `state.json` (datos de usuario) al cerrar limpiamente, con una escritura síncrona serializada con las demás. Los borradores HTTP pasan por `strip_secrets`. Las escrituras del historial esperan a su carga para no machacarlo (riesgo detectado y corregido en H3).
+- Sin MSI ni icono de recurso en el .exe de Windows (habría que añadir `embed-resource`, que no puedo probar aquí); el zip portable es el artefacto de H3.
+- El identificador de bundle por defecto `io.github.enshetinin.simpleeditor` se deriva del repo y se puede cambiar con `SE_BUNDLE_ID`; es una decisión tuya (`docs/RELEASE.md`).
+
+## Checklist manual de H3 (además de los de H1/H2 más abajo)
+1. Abre el DMG `dist/SimpleEditor-0.1.0-macos-arm64.dmg` y arrastra la app a Aplicaciones. Ábrela: Gatekeeper avisará (clic derecho → Abrir).
+2. `/Applications/SimpleEditor.app/Contents/MacOS/se --install-cli`; añade `~/.local/bin` al PATH y prueba `se .` desde la terminal.
+3. Abre archivos y peticiones y cierra la app; `se .` de nuevo: deben volver los archivos con su cursor y la pestaña activa.
+4. Arrastra un archivo y una carpeta desde Finder a la ventana.
+5. VoiceOver (Cmd+F5): enfoca el editor y muévete con las flechas; debe leer la línea y la posición.
+6. Ctrl+Tab entre pestañas; ventana a 960×640; escalado en Ajustes > Pantallas.
+7. Reposo: `se .`, sin tocar el ratón 60 s (Monitor de Actividad ≈ 0 %).
+8. Windows: zip de la CI → `simpleeditor.exe` desde el Explorador (sin consola), `se.exe --install-cli`, Narrador, 150/200 %.
+
+## Siguiente paso
+Push de `develop` → revisar la CI (Windows y el job `package`) → checklists manuales → decisiones de `docs/RELEASE.md` → release solo cuando lo pidas.
+
+---
+
 Actualizado: 2026-10-15 — cierre de **H2** (HTTP de uso diario).
 Base: commit local `dbc9938` (H1) + cambios de H2 **sin commit**. Tu rama `develop` va 1 commit por delante de `origin` (H1 no está pusheado). No he hecho commit ni push.
 

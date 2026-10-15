@@ -271,6 +271,23 @@ impl Jobs {
         });
     }
 
+    /// Same as [`Self::save_user_data`] but synchronous (app exit).
+    pub fn write_user_data_blocking(
+        &self,
+        dir: PathBuf,
+        entries: Vec<HistoryEntry>,
+        state: UserState,
+    ) -> std::io::Result<()> {
+        let generation = self.next_gen();
+        let mut last = self
+            .user_writes
+            .lock()
+            .map_err(|_| std::io::Error::other("user data lock poisoned"))?;
+        *last = (*last).max(generation);
+        history::save_history(&history::history_path(&dir), &entries)?;
+        history::save_state(&history::state_path(&dir), &state)
+    }
+
     pub fn save_collection(
         &self,
         root: PathBuf,

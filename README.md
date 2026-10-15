@@ -6,10 +6,11 @@ SimpleEditor is an open source desktop code editor written in Rust for macOS and
 Windows, with a built-in HTTP client. It runs locally: no accounts, no
 subscriptions, no telemetry.
 
-> Status: **H2 preview**. The editor (H1) and the daily-use HTTP client (H2)
-> work: collections, environments, variables, secrets, history and cURL
-> import/export. Packaging and installers arrive in H3. See
-> [docs/STATUS.md](docs/STATUS.md) for what is verified and what is pending.
+> Status: **H3 preview — not released yet**. Editor, HTTP client, session
+> restore, packaging scripts and accessibility basics are in place; packages
+> are unsigned until the owner provides signing credentials. See
+> [docs/STATUS.md](docs/STATUS.md) for what is verified and
+> [docs/RELEASE.md](docs/RELEASE.md) for the release checklist.
 
 ## Requirements
 
@@ -22,15 +23,37 @@ subscriptions, no telemetry.
 
 ```sh
 cargo build --release
-./target/release/se .                 # open the current folder
+./target/release/se .                 # open the current folder (restores its last session)
 ./target/release/se src/main.rs       # open files (relative to the current dir)
 ./target/release/se --help
 ```
 
-On Windows use `target\release\se.exe .`. The same program is also built as
-`simpleeditor` (alternative name). Installing the `se` command on your `PATH`
-is not automated yet; you can run it from `target/release/` or copy it
-yourself without replacing an existing `se`.
+On Windows use `target\release\se.exe .`. `simpleeditor` is the same
+program; on Windows `simpleeditor.exe` is the GUI launcher (no console
+window) for Explorer and shortcuts, while `se.exe` is the command-line one.
+
+### Install the `se` command (optional)
+
+```sh
+se --install-cli                      # macOS: ~/.local/bin/se, Windows: %LOCALAPPDATA%\SimpleEditor\bin\se.cmd
+se --install-cli --name simpleeditor  # if you already have another `se`
+se --uninstall-cli
+```
+
+It never replaces a file it did not create, and it does not change your
+PATH: it prints what to add if the folder is not on it. From the macOS app
+bundle: `/Applications/SimpleEditor.app/Contents/MacOS/se --install-cli`.
+
+### Packages
+
+```sh
+./scripts/package-macos.sh            # dist/SimpleEditor-<v>-macos-arm64.{zip,dmg}
+pwsh ./scripts/package-windows.ps1    # dist\SimpleEditor-<v>-windows-x86_64.zip
+```
+
+Packages are ad-hoc signed (macOS) or unsigned (Windows) unless signing
+credentials are provided (see the scripts). Gatekeeper/SmartScreen will warn
+about unsigned builds. CI builds both and keeps them as workflow artifacts.
 
 ## Using it
 
@@ -47,6 +70,10 @@ yourself without replacing an existing `se`.
 - Unsaved changes are copied to a private recovery folder (never next to
   your files). After a crash, SimpleEditor offers to restore them as unsaved
   changes; the original files are not touched.
+- Drag files or folders onto the window to open them. Opening a folder with
+  `se .` restores its last session (open files with their cursor, requests,
+  theme); secrets are never stored in the session.
+- Screen readers announce the editor's current line, line/column and file.
 - If another program changes an open file, an unmodified tab reloads it; a
   modified tab shows a banner to reload or keep your version, and saving
   never overwrites the other program's version without asking.
@@ -64,6 +91,7 @@ yourself without replacing an existing `se`.
 | Document start/end | Cmd+↑/↓ | Ctrl+Home/End |
 | Indent / outdent | Tab / Shift+Tab | Tab / Shift+Tab |
 | Send HTTP request | Cmd+Enter | Ctrl+Enter |
+| Next / previous tab | Ctrl+Tab / Ctrl+Shift+Tab | Ctrl+Tab / Ctrl+Shift+Tab |
 
 ### HTTP
 *New HTTP request* (or **+** in the HTTP section of the sidebar) opens a
@@ -129,6 +157,9 @@ own temporary folders and an in-memory secret store, so they never touch your
 real data or Keychain). Specifications live
 in [`docs/`](docs).
 
-## License
+## Contributing, security and licenses
 
-MIT — see [LICENSE](LICENSE).
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
+SimpleEditor is MIT licensed — see [LICENSE](LICENSE). Third-party licenses
+of everything included in the binaries (crates and the embedded fonts) are
+in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).

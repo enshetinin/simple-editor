@@ -48,6 +48,8 @@ pub struct EditorInput<'a> {
     /// Char ranges of search matches (sorted) and the current one.
     pub matches: &'a [Range<usize>],
     pub current_match: Option<usize>,
+    /// Name announced by screen readers (e.g. the file name).
+    pub name: &'a str,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -396,11 +398,42 @@ pub fn show(
                 );
             }
 
-            response.widget_info(|| {
-                egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "Code editor")
-            });
+            // Screen readers get the current line as the value and a label
+            // with the position. This closure only runs when accessibility
+            // is active, so it costs nothing otherwise.
+            let doc_ref: &Document = doc;
+            let name = input.name;
+            response.widget_info(|| accessibility_info(doc_ref, name));
         });
     out
+}
+
+/// Accessibility description: position in the label, current line as text.
+fn accessibility_info(doc: &Document, name: &str) -> egui::WidgetInfo {
+    const MAX_CHARS: usize = 10_000;
+    let sel = doc.selection();
+    let rope = doc.rope();
+    let line = rope.char_to_line(sel.head);
+    let start = rope.line_to_char(line);
+    let end = doc.line_end(line);
+    let text: String = rope.slice(start..end).chars().take(MAX_CHARS).collect();
+    let col = sel.head - start;
+    let mut info = egui::WidgetInfo::labeled(
+        egui::WidgetType::TextEdit,
+        true,
+        format!(
+            "Code editor: {name}, line {} of {}, column {}",
+            line + 1,
+            rope.len_lines(),
+            col + 1
+        ),
+    );
+    let len = text.chars().count();
+    let clamp = |c: usize| c.saturating_sub(start).min(len);
+    info.text_selection =
+        Some(egui::text::CharIndex(clamp(sel.start()))..egui::text::CharIndex(clamp(sel.end())));
+    info.current_text_value = Some(text);
+    info
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -839,6 +872,10 @@ fn vertical(doc: &mut Document, up: bool, lines: usize, extend: bool) {
 
 fn display_col(doc: &Document, line: usize, col: usize) -> usize {
     let start = doc.rope().line_to_char(line);
+    // Long lines are drawn at a fixed width (tab = 1 column): no scan needed.
+    if doc.line_end(line) - start > LONG_LINE_CHARS {
+        return col;
+    }
     let mut display = 0;
     for c in doc.rope().slice(start..start + col).chars() {
         display += if c == '\t' {
@@ -853,6 +890,9 @@ fn display_col(doc: &Document, line: usize, col: usize) -> usize {
 fn char_col_for_display(doc: &Document, line: usize, want: usize) -> usize {
     let start = doc.rope().line_to_char(line);
     let len = doc.line_end(line) - start;
+    if len > LONG_LINE_CHARS {
+        return want.min(len);
+    }
     let mut display = 0;
     for (i, c) in doc.rope().slice(start..start + len).chars().enumerate() {
         let w = if c == '\t' {
@@ -947,6 +987,7 @@ mod view_tests {
                         highlight: None,
                         matches: &[],
                         current_match: None,
+                        name: "test",
                     },
                 );
             });

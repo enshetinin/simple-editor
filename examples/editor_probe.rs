@@ -239,6 +239,7 @@ impl Harness {
                         highlight: spans,
                         matches: &[],
                         current_match: None,
+                        name: "probe",
                     },
                 );
             });

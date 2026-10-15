@@ -61,10 +61,15 @@ impl SimpleEditorApp {
                 crate::editor::document::LONG_LINE_CHARS
             ));
         }
+        let path = tab.doc.path().map(Path::to_path_buf);
         self.tabs.push(Tab::Doc(Box::new(tab)));
+        let previous_active = self.active;
         self.active = Some(key);
         self.ctx
             .memory_mut(|m| m.request_focus(super::view::editor_id(key)));
+        if let Some(path) = path {
+            self.on_restored_doc(key, &path, previous_active);
+        }
     }
 
     pub fn new_file(&mut self) {

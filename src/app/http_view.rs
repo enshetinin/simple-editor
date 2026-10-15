@@ -141,40 +141,46 @@ impl SimpleEditorApp {
                                 ui.selectable_value(&mut tab.def.method, m, m.as_str());
                             }
                         });
-                    let button_width = 96.0;
-                    let url_width = (ui.available_width() - button_width - 40.0).max(120.0);
-                    let url = ui.add(
-                        TextEdit::singleline(&mut tab.def.url)
-                            .id(Id::new(("url", key)))
-                            .hint_text(s::URL_HINT)
-                            .font(TextStyle::Monospace)
-                            .desired_width(url_width),
-                    );
-                    if url.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        actions.push(Action::Send);
-                    }
-                    if sending {
-                        if ui
-                            .add_sized([button_width, 24.0], egui::Button::new(s::CANCEL_REQUEST))
-                            .clicked()
-                        {
-                            actions.push(Action::Cancel);
+                    // Buttons first (right to left); the URL then takes
+                    // exactly the remaining width, so the row never overflows.
+                    let button_width = 88.0;
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if sending {
+                            if ui
+                                .add_sized(
+                                    [button_width, 24.0],
+                                    egui::Button::new(s::CANCEL_REQUEST),
+                                )
+                                .clicked()
+                            {
+                                actions.push(Action::Cancel);
+                            }
+                        } else {
+                            ui.menu_button("▾", |ui| {
+                                if ui.button(s::SEND_TO_FILE).clicked() {
+                                    actions.push(Action::SendToFile);
+                                    ui.close();
+                                }
+                            });
+                            if ui
+                                .add_sized([button_width, 24.0], primary_button(ui.ctx(), s::SEND))
+                                .on_hover_text(s::SEND_SHORTCUT_HINT)
+                                .clicked()
+                            {
+                                actions.push(Action::Send);
+                            }
                         }
-                    } else {
-                        if ui
-                            .add_sized([button_width, 24.0], primary_button(ui.ctx(), s::SEND))
-                            .on_hover_text(s::SEND_SHORTCUT_HINT)
-                            .clicked()
-                        {
+                        let url = ui.add(
+                            TextEdit::singleline(&mut tab.def.url)
+                                .id(Id::new(("url", key)))
+                                .hint_text(s::URL_HINT)
+                                .font(TextStyle::Monospace)
+                                .desired_width(ui.available_width()),
+                        );
+                        if url.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             actions.push(Action::Send);
                         }
-                        ui.menu_button("▾", |ui| {
-                            if ui.button(s::SEND_TO_FILE).clicked() {
-                                actions.push(Action::SendToFile);
-                                ui.close();
-                            }
-                        });
-                    }
+                    });
                 });
 
                 // Request sections.

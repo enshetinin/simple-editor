@@ -17,6 +17,15 @@ pub enum CliAction {
     Launch(LaunchArgs),
     Help,
     Version,
+    /// Opt-in: put a command on the PATH (`--install-cli`).
+    InstallCli {
+        name: String,
+        dir: Option<PathBuf>,
+    },
+    UninstallCli {
+        name: String,
+        dir: Option<PathBuf>,
+    },
     Error(String),
 }
 
@@ -29,9 +38,15 @@ pub fn help_text(bin: &str) -> String {
          Arguments:\n  [PATH]...  A folder to open as the project and/or files to open.\n\
          \x20            Relative paths are resolved from the current directory.\n\
          \n\
-         Options:\n  -h, --help     Print help\n  -V, --version  Print version\n\
+         Options:\n  -h, --help          Print help\n  -V, --version       Print version\n\
+         \x20     --install-cli   Install the `se` command (opt-in; never replaces another `se`)\n\
+         \x20     --uninstall-cli Remove the command installed by --install-cli\n\
+         \x20     --name NAME     Command name for --install-cli/--uninstall-cli (default: se;\n\
+         \x20                     use `simpleeditor` if another `se` exists)\n\
+         \x20     --dir DIR       Folder for the command (default: ~/.local/bin on macOS,\n\
+         \x20                     %LOCALAPPDATA%\\SimpleEditor\\bin on Windows)\n\
          \n\
-         Examples:\n  {bin} .\n  {bin} src/main.rs README.md\n",
+         Examples:\n  {bin} .\n  {bin} src/main.rs README.md\n  {bin} --install-cli --name simpleeditor\n",
         version = env!("CARGO_PKG_VERSION"),
     )
 }
@@ -42,15 +57,40 @@ where
 {
     let mut launch = LaunchArgs::default();
     let mut options_done = false;
-    for arg in args {
+    let mut install: Option<bool> = None;
+    let mut name = "se".to_owned();
+    let mut dir: Option<PathBuf> = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
         if !options_done {
             match arg.to_str() {
                 Some("-h" | "--help") => return CliAction::Help,
                 Some("-V" | "--version") => return CliAction::Version,
+                Some("--install-cli") => {
+                    install = Some(true);
+                    continue;
+                }
+                Some("--uninstall-cli") => {
+                    install = Some(false);
+                    continue;
+                }
+                Some(flag @ ("--name" | "--dir")) => {
+                    let Some(value) = args.next() else {
+                        return CliAction::Error(format!("{flag} needs a value"));
+                    };
+                    if flag == "--name" {
+                        name = value.to_string_lossy().into_owned();
+                    } else {
+                        dir = Some(normalize(&cwd.join(PathBuf::from(value))));
+                    }
+                    continue;
+                }
                 Some("--") => {
                     options_done = true;
                     continue;
                 }
+                // Finder on older macOS passes a process serial number.
+                Some(s) if s.starts_with("-psn_") => continue,
                 Some(s) if s.starts_with('-') && s.len() > 1 => {
                     return CliAction::Error(format!("unknown option '{s}' (see --help)"));
                 }
@@ -72,7 +112,17 @@ where
             ));
         }
     }
-    CliAction::Launch(launch)
+    match install {
+        Some(_) if launch.root.is_some() || !launch.files.is_empty() => {
+            CliAction::Error("--install-cli/--uninstall-cli do not take paths".to_owned())
+        }
+        Some(true) => CliAction::InstallCli { name, dir },
+        Some(false) => CliAction::UninstallCli { name, dir },
+        None if name != "se" || dir.is_some() => CliAction::Error(
+            "--name and --dir are only used with --install-cli/--uninstall-cli".to_owned(),
+        ),
+        None => CliAction::Launch(launch),
+    }
 }
 
 /// Lexically removes `.` and `..` components without touching the file system
@@ -139,6 +189,36 @@ mod tests {
         ));
         assert_eq!(
             parse(args(&[]), &cwd),
+            CliAction::Launch(LaunchArgs::default())
+        );
+        assert_eq!(
+            parse(args(&["--install-cli"]), &cwd),
+            CliAction::InstallCli {
+                name: "se".into(),
+                dir: None
+            }
+        );
+        assert_eq!(
+            parse(
+                args(&["--uninstall-cli", "--name", "simpleeditor", "--dir", "bin"]),
+                &cwd
+            ),
+            CliAction::UninstallCli {
+                name: "simpleeditor".into(),
+                dir: Some(cwd.join("bin"))
+            }
+        );
+        assert!(matches!(
+            parse(args(&["--name", "x"]), &cwd),
+            CliAction::Error(_)
+        ));
+        assert!(matches!(
+            parse(args(&["--install-cli", "."]), &cwd),
+            CliAction::Error(_)
+        ));
+        assert!(matches!(parse(args(&["--dir"]), &cwd), CliAction::Error(_)));
+        assert_eq!(
+            parse(args(&["-psn_0_12345"]), &cwd),
             CliAction::Launch(LaunchArgs::default())
         );
     }

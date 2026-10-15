@@ -307,7 +307,16 @@ impl SimpleEditorApp {
         }
     }
 
-    fn save_user_data(&self) {
+    pub(super) fn open_request_definition(&mut self, def: RequestDefinition) {
+        self.open_request_tab(def, None);
+    }
+
+    pub(super) fn save_user_data(&mut self) {
+        if !self.user_data_loaded {
+            // Writing now would replace history we have not read yet.
+            self.user_data_dirty = true;
+            return;
+        }
         if let Some(dir) = &self.data_dir {
             self.jobs
                 .save_user_data(dir.clone(), self.history.clone(), self.user_state.clone());
@@ -604,7 +613,17 @@ impl SimpleEditorApp {
                         "Request history could not be read ({e}); it will start empty."
                     )),
                 }
+                // Keep values chosen before the file finished loading.
+                let mut state = state;
+                for (k, v) in std::mem::take(&mut self.user_state.active_environment) {
+                    state.active_environment.insert(k, v);
+                }
                 self.user_state = state;
+                self.user_data_loaded = true;
+                self.apply_saved_theme();
+                if std::mem::take(&mut self.user_data_dirty) {
+                    self.save_user_data();
+                }
                 if let Some(p) = self.project.as_mut()
                     && p.active_env.is_none()
                     && let Some(id) = self.user_state.active_environment.get(&p.root_key())
