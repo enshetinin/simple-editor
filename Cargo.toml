@@ -1,0 +1,33 @@
+[package]
+name = "simpleeditor"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "SimpleEditor: a fast desktop code editor with a built-in HTTP client."
+license = "MIT"
+repository = "https://github.com/enshetinin/simple-editor"
+default-run = "se"
+publish = false
+
+[[bin]]
+name = "se"
+path = "src/main.rs"
+
+[[bin]]
+name = "simpleeditor"
+path = "src/bin/simpleeditor.rs"
+
+[dependencies]
+eframe = { version = "0.36.2", default-features = false, features = ["accesskit", "default_fonts", "wgpu"] }
+reqwest = { version = "0.13.5" }
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "time", "sync"] }
+rfd = { version = "0.17.2", default-features = false }
+tempfile = "3.27.0"
+url = "2.5.8"
+
+[dev-dependencies]
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "time", "sync", "net", "io-util", "macros"] }
+ropey = "1.6.1"
+
+[profile.release]
+debug = "line-tables-only"
