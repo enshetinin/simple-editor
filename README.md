@@ -6,11 +6,10 @@ SimpleEditor is an open source desktop code editor written in Rust for macOS and
 Windows, with a built-in HTTP client. It runs locally: no accounts, no
 subscriptions, no telemetry.
 
-> Status: **H1 preview** (reliable editor milestone). Editing, saving, crash
-> recovery, find/replace and syntax highlighting work; the HTTP client is the
-> H0 slice (method, URL, body, send/cancel). Collections, variables and
-> environments arrive in H2. See [docs/STATUS.md](docs/STATUS.md) for what is
-> verified and what is pending.
+> Status: **H2 preview**. The editor (H1) and the daily-use HTTP client (H2)
+> work: collections, environments, variables, secrets, history and cURL
+> import/export. Packaging and installers arrive in H3. See
+> [docs/STATUS.md](docs/STATUS.md) for what is verified and what is pending.
 
 ## Requirements
 
@@ -67,11 +66,41 @@ yourself without replacing an existing `se`.
 | Send HTTP request | Cmd+Enter | Ctrl+Enter |
 
 ### HTTP
-*New HTTP request* opens a request tab. Choose the method, type an `http://`
-or `https://` URL, an optional body (JSON or text) and press **Send** (or
-`Cmd/Ctrl+Enter`). **Cancel** stops the request. The response shows status,
-time, size, final URL, body and headers. Bodies above 5 MiB are truncated in
-the preview; timeout is 30 s.
+*New HTTP request* (or **+** in the HTTP section of the sidebar) opens a
+request tab:
+
+- **Method + URL**, then **Params**, **Headers** (both with on/off and
+  repeated keys), **Body** (None / Text / JSON, with *Format JSON*), **Auth**
+  (None / Bearer / Basic), request **Variables** and **Settings** (timeout,
+  download limit). **Send** or `Cmd/Ctrl+Enter`; **Cancel** stops it;
+  *Send ▾ → Send and save response to file…* streams the body to disk.
+- **Variables** `{{name}}` work in URL, params, headers, body and auth.
+  Precedence: request variables > active environment > project variables.
+  An unknown variable blocks sending and names the field.
+- **Environments** and project variables are edited from *✎* in the sidebar.
+  Variables marked *Secret* are never written to project files, history or
+  exports; they live in memory for the session unless *Remember* stores them
+  in the macOS Keychain / Windows Credential Manager. If that store fails, the
+  secret stays in memory only (never plain text on disk).
+- **Collections** are saved in the project as readable JSON for Git:
+  `.simpleeditor/collections/*.json`, `.simpleeditor/environments/*.json`,
+  `.simpleeditor/variables.json` (each with `schema_version`). Nothing is
+  created until you save. Literal credentials (a token typed directly into
+  Auth or an `Authorization` header) are left out when saving; use a secret
+  variable instead. Collections can be exported (secrets left out unless you
+  choose *Export including secrets*) and imported (never overwriting an
+  existing collection).
+- **History** keeps the last 100 requests in your user data folder, without
+  bodies or credentials.
+- **cURL**: *⋯ → Import cURL…* parses a pasted command (never executes it);
+  *Copy as cURL* exports for POSIX shells. The exact supported subset is in
+  [docs/CURL.md](docs/CURL.md).
+- Responses show status, time, size, final URL, headers and the body (pretty
+  JSON or raw; invalid JSON, binary, empty and truncated bodies are labeled).
+  The preview keeps up to 5 MiB of decompressed data; gzip/deflate/brotli are
+  decoded automatically. Redirects are followed up to 10 times and
+  `Authorization`/`Cookie` are not sent to another origin. TLS certificates
+  are always verified; the timeout is 30 s by default.
 
 ## Development
 
@@ -89,12 +118,15 @@ test resolves the reserved `.invalid` domain to check DNS error reporting.
 
 Code layout: `src/editor` (rope document, undo history, Unicode movement,
 search, encoding, safe save), `src/syntax` (Tree-sitter worker),
-`src/storage` (crash recovery), `src/http` (request validation, client,
-cancellable service), `src/workspace.rs` (on-demand file tree), `src/cli.rs`,
+`src/storage` (crash recovery, project collections/environments, history),
+`src/http` (request model, variables, validation, client, cancellable
+service, cURL, secrets), `src/workspace.rs` (on-demand file tree), `src/cli.rs`,
 `src/app` (egui UI, custom editor widget in `editor_view.rs`).
 
-Set `SE_DATA_DIR` to keep recovery data in another folder (tests do this so
-they never touch your real data directory). Specifications live
+Set `SE_DATA_DIR` to keep recovery data, history and state in another folder
+and `SE_SECRET_BACKEND=memory` to keep secrets in memory only (tests use their
+own temporary folders and an in-memory secret store, so they never touch your
+real data or Keychain). Specifications live
 in [`docs/`](docs).
 
 ## License

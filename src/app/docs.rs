@@ -85,7 +85,7 @@ impl SimpleEditorApp {
 
     pub fn open_folder_dialog(&mut self) {
         if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-            self.workspace.set_root(dir);
+            self.open_folder(dir);
         }
     }
 
@@ -240,6 +240,8 @@ impl SimpleEditorApp {
                 loaded,
                 text,
             } => self.on_restored(entry, loaded, text),
+            env @ JobResult::EnvironmentsSaved { .. } => self.on_env_saved(env),
+            other => self.on_http_job(other),
         }
     }
 

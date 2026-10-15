@@ -132,7 +132,15 @@ impl SimpleEditorApp {
 
     fn run_command(&mut self, command: Command) {
         match command {
-            Command::Save => self.save_active(false),
+            Command::Save => match self.active_tab() {
+                Some(Tab::Doc(_)) => self.save_active(false),
+                Some(Tab::Http(_) | Tab::Env(_)) => {
+                    if let Some(key) = self.active {
+                        self.save_any(key, AfterSave::Nothing);
+                    }
+                }
+                None => {}
+            },
             Command::SaveAs => self.save_active(true),
             Command::Open => self.open_file_dialog(),
             Command::NewFile => self.new_file(),
@@ -199,13 +207,13 @@ impl SimpleEditorApp {
                     self.theme_preference = next;
                     ui.ctx().set_theme(next);
                 }
-                let can_save = matches!(self.active_tab(), Some(Tab::Doc(_)));
+                let can_save = self.active_tab().is_some();
                 if ui
                     .add_enabled(can_save, egui::Button::new(s::SAVE))
                     .on_hover_text("Save (Cmd/Ctrl+S)")
                     .clicked()
                 {
-                    self.save_active(false);
+                    self.run_command(Command::Save);
                 }
             });
         });
@@ -249,8 +257,27 @@ impl SimpleEditorApp {
                         ui.label(secondary(s::UNSAVED_TITLE.to_owned()));
                     }
                 }
-                Some(Tab::Http(_)) => {
+                Some(Tab::Http(h)) => {
                     ui.label(secondary("HTTP request".to_owned()));
+                    if let Some(env) = self.project.as_ref().and_then(|p| p.active_env_name()) {
+                        ui.separator();
+                        ui.label(secondary(format!("Environment: {env}")));
+                    }
+                    if h.saving {
+                        ui.separator();
+                        ui.spinner();
+                        ui.label(secondary(s::SAVING.to_owned()));
+                    } else if h.is_dirty() {
+                        ui.separator();
+                        ui.label(secondary(s::UNSAVED_TITLE.to_owned()));
+                    }
+                }
+                Some(Tab::Env(e)) => {
+                    ui.label(secondary(s::ENVIRONMENTS.to_owned()));
+                    if e.is_dirty() {
+                        ui.separator();
+                        ui.label(secondary(s::UNSAVED_TITLE.to_owned()));
+                    }
                 }
                 None => {
                     ui.label(secondary(String::new()));
@@ -268,6 +295,10 @@ impl SimpleEditorApp {
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
+        // Long names (files, requests, URLs) are truncated with "…" (full
+        // text on hover) instead of widening the panel: the panel must only
+        // change width when the user drags its edge.
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
         let p = palette(ui.ctx());
         let heading = |t: &str| RichText::new(t).small().strong().color(p.text_secondary);
         ScrollArea::vertical()
@@ -286,39 +317,7 @@ impl SimpleEditorApp {
                 }
                 ui.add_space(12.0);
                 ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label(heading(s::SECTION_HTTP));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.small_button("+").on_hover_text(s::NEW_REQUEST).clicked() {
-                            self.new_request();
-                        }
-                    });
-                });
-                let requests: Vec<(TabKey, String)> = self
-                    .tabs
-                    .iter()
-                    .filter_map(|t| match t {
-                        Tab::Http(h) => {
-                            Some((h.key, format!("{}  {}", h.draft.method.as_str(), h.title)))
-                        }
-                        Tab::Doc(_) => None,
-                    })
-                    .collect();
-                if requests.is_empty() {
-                    ui.label(
-                        RichText::new(s::NO_REQUESTS)
-                            .color(p.text_secondary)
-                            .small(),
-                    );
-                }
-                for (key, label) in requests {
-                    if ui
-                        .selectable_label(self.active == Some(key), label)
-                        .clicked()
-                    {
-                        self.active = Some(key);
-                    }
-                }
+                self.http_sidebar(ui);
             });
     }
 
@@ -406,7 +405,8 @@ impl SimpleEditorApp {
         };
         match &mut self.tabs[index] {
             Tab::Doc(_) => self.doc_view(ui, key),
-            Tab::Http(_) => self.http_tab(ui, key),
+            Tab::Http(_) => self.http_tab_view(ui, key),
+            Tab::Env(_) => self.env_tab_view(ui, key),
         }
     }
 
@@ -476,8 +476,8 @@ impl SimpleEditorApp {
             let dirty = tab.is_dirty();
             let title = tab.title();
             let prefix = match tab {
-                Tab::Http(h) => format!("{} ", h.draft.method.as_str()),
-                Tab::Doc(_) => String::new(),
+                Tab::Http(h) => format!("{} ", h.def.method.as_str()),
+                Tab::Doc(_) | Tab::Env(_) => String::new(),
             };
             let frame = egui::Frame::NONE
                 .fill(if selected { p.surface } else { p.background })
@@ -634,7 +634,9 @@ impl SimpleEditorApp {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
-        let Some(dialog) = &self.dialog else { return };
+        let Some(mut dialog) = self.dialog.take() else {
+            return;
+        };
         let p = palette(ctx);
         enum Choice {
             None,
@@ -644,6 +646,10 @@ impl SimpleEditorApp {
             Discard(TabKey),
             SaveAll,
             DiscardAll,
+            SaveRequestAs,
+            ImportCurl,
+            DeleteCollection(String),
+            DeleteRequest(String, String),
             Cancel,
         }
         let mut choice = Choice::None;
@@ -660,9 +666,20 @@ impl SimpleEditorApp {
                 .map(Tab::title)
                 .unwrap_or_default()
         };
+        let collections: Vec<(String, String)> = self
+            .project
+            .as_ref()
+            .map(|p| {
+                p.data
+                    .collections
+                    .iter()
+                    .map(|c| (c.id.clone(), c.name.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
         let modal = egui::Modal::new(Id::new("app_dialog")).show(ctx, |ui| {
-            ui.set_max_width(420.0);
-            match dialog {
+            ui.set_max_width(480.0);
+            match &mut dialog {
                 Dialog::CloseTab(key) => {
                     ui.heading(s::UNSAVED_TITLE);
                     ui.label(format!("{} \"{}\"?", s::UNSAVED_ONE, tab_name(*key)));
@@ -717,38 +734,411 @@ impl SimpleEditorApp {
                         }
                     });
                 }
+                Dialog::SaveRequest {
+                    collection,
+                    new_collection,
+                    name,
+                    ..
+                } => {
+                    ui.heading(s::SAVE_REQUEST_TITLE);
+                    ui.horizontal(|ui| {
+                        ui.label(s::NAME);
+                        ui.text_edit_singleline(name);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(s::COLLECTION);
+                        let current = collection
+                            .as_ref()
+                            .and_then(|id| collections.iter().find(|(c, _)| c == id))
+                            .map_or("—".to_owned(), |(_, n)| n.clone());
+                        egui::ComboBox::from_id_salt("save_req_collection")
+                            .selected_text(current)
+                            .show_ui(ui, |ui| {
+                                for (id, n) in &collections {
+                                    ui.selectable_value(collection, Some(id.clone()), n);
+                                }
+                            });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(new_collection)
+                                .hint_text(s::NEW_COLLECTION_HINT),
+                        );
+                    });
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        let can = collection.is_some() || !new_collection.trim().is_empty();
+                        if ui
+                            .add_enabled(can, primary_button(ui.ctx(), s::SAVE))
+                            .clicked()
+                        {
+                            choice = Choice::SaveRequestAs;
+                        }
+                        if ui.button(s::CANCEL).clicked() {
+                            choice = Choice::Cancel;
+                        }
+                    });
+                }
+                Dialog::ImportCurl { text, error } => {
+                    ui.heading(s::IMPORT_CURL_TITLE);
+                    ui.label(RichText::new(s::IMPORT_CURL_HELP).small().color(p.text_secondary));
+                    ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(text)
+                                .code_editor()
+                                .desired_rows(8)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("curl https://api.example.com/items -H 'Accept: application/json'"),
+                        );
+                    });
+                    if let Some(e) = error {
+                        ui.label(RichText::new(format!("⚠ {e}")).color(p.error));
+                    }
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(!text.trim().is_empty(), primary_button(ui.ctx(), s::IMPORT))
+                            .clicked()
+                        {
+                            choice = Choice::ImportCurl;
+                        }
+                        if ui.button(s::CANCEL).clicked() {
+                            choice = Choice::Cancel;
+                        }
+                    });
+                }
+                Dialog::DeleteRequest(cid, rid) => {
+                    let name = self
+                        .project
+                        .as_ref()
+                        .and_then(|p| p.collection(cid))
+                        .and_then(|c| c.requests.iter().find(|r| &r.id == rid))
+                        .map_or(String::new(), |r| r.name.clone());
+                    ui.heading(s::DELETE_REQUEST_TITLE);
+                    ui.label(format!("\"{name}\""));
+                    ui.label(s::DELETE_REQUEST_BODY);
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(s::DELETE).clicked() {
+                            choice = Choice::DeleteRequest(cid.clone(), rid.clone());
+                        }
+                        if ui.add(primary_button(ui.ctx(), s::CANCEL)).clicked() {
+                            choice = Choice::Cancel;
+                        }
+                    });
+                }
+                Dialog::DeleteCollection(id) => {
+                    let name = collections
+                        .iter()
+                        .find(|(c, _)| c == id)
+                        .map_or(id.clone(), |(_, n)| n.clone());
+                    ui.heading(s::DELETE_COLLECTION_TITLE);
+                    ui.label(format!("\"{name}\""));
+                    ui.label(s::DELETE_COLLECTION_BODY);
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(s::DELETE).clicked() {
+                            choice = Choice::DeleteCollection(id.clone());
+                        }
+                        if ui.add(primary_button(ui.ctx(), s::CANCEL)).clicked() {
+                            choice = Choice::Cancel;
+                        }
+                    });
+                }
             }
         });
         if modal.should_close() && matches!(choice, Choice::None) {
             choice = Choice::Cancel;
         }
         match choice {
-            Choice::None => {}
-            Choice::Cancel => self.dialog = None,
+            Choice::None => self.dialog = Some(dialog),
+            Choice::Cancel => {}
             Choice::Save(key, then) => {
-                self.dialog = None;
-                self.save_tab(key, false, false, then);
+                self.save_any(key, then);
             }
             Choice::Overwrite(key, then) => {
-                self.dialog = None;
                 self.save_tab(key, false, true, then);
             }
             Choice::SaveCopy(key, then) => {
-                self.dialog = None;
                 self.save_tab(key, true, false, then);
             }
-            Choice::Discard(key) => {
-                self.dialog = None;
-                self.close_tab_now(key);
-            }
-            Choice::SaveAll => {
-                self.dialog = None;
-                self.save_all_and_quit();
-            }
+            Choice::Discard(key) => self.close_tab_now(key),
+            Choice::SaveAll => self.save_all_and_quit(),
             Choice::DiscardAll => self.quit_now(),
+            Choice::SaveRequestAs => {
+                if let Dialog::SaveRequest {
+                    tab,
+                    collection,
+                    new_collection,
+                    name,
+                    then,
+                } = dialog
+                {
+                    self.save_request_as(tab, collection, &new_collection, &name, then);
+                }
+            }
+            Choice::ImportCurl => {
+                if let Dialog::ImportCurl { text, .. } = &dialog {
+                    let text = text.clone();
+                    if let Err(e) = self.import_curl(&text) {
+                        self.dialog = Some(Dialog::ImportCurl {
+                            text,
+                            error: Some(e),
+                        });
+                    }
+                }
+            }
+            Choice::DeleteCollection(id) => self.delete_collection(&id),
+            Choice::DeleteRequest(cid, rid) => self.delete_request(&cid, &rid),
+        }
+    }
+
+    fn http_sidebar(&mut self, ui: &mut egui::Ui) {
+        let p = palette(ui.ctx());
+        let heading = |t: &str| RichText::new(t).small().strong().color(p.text_secondary);
+        ui.horizontal(|ui| {
+            ui.label(heading(s::SECTION_HTTP));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.small_button("+").on_hover_text(s::NEW_REQUEST).clicked() {
+                    self.new_request();
+                }
+                ui.menu_button("⋯", |ui| {
+                    if ui.button(s::IMPORT_CURL).clicked() {
+                        self.dialog = Some(Dialog::ImportCurl {
+                            text: String::new(),
+                            error: None,
+                        });
+                        ui.close();
+                    }
+                    if ui.button(s::IMPORT_COLLECTION).clicked() {
+                        self.import_collection_dialog();
+                        ui.close();
+                    }
+                    if ui.button(s::EDIT_ENVIRONMENTS).clicked() {
+                        self.open_environments();
+                        ui.close();
+                    }
+                });
+            });
+        });
+        // Environment selector.
+        let env_info = self.project.as_ref().filter(|p| p.loaded).map(|project| {
+            let envs: Vec<(String, String)> = project
+                .data
+                .environments
+                .iter()
+                .map(|e| (e.id.clone(), e.name.clone()))
+                .collect();
+            let current = project
+                .active_env_name()
+                .unwrap_or(s::NO_ENVIRONMENT)
+                .to_owned();
+            (envs, project.active_env.clone(), current)
+        });
+        if let Some((envs, active, current)) = env_info {
+            let mut set: Option<Option<String>> = None;
+            let mut edit = false;
+            // Edit button first (right to left): the truncated combo then
+            // takes only the remaining width and the row never overflows,
+            // which would make the panel grow every frame.
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                edit = ui
+                    .small_button("✎")
+                    .on_hover_text(s::EDIT_ENVIRONMENTS)
+                    .clicked();
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    egui::ComboBox::from_id_salt("sidebar_env")
+                        .selected_text(current)
+                        .width(96.0)
+                        .truncate()
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_label(active.is_none(), s::NO_ENVIRONMENT)
+                                .clicked()
+                            {
+                                set = Some(None);
+                            }
+                            for (id, name) in &envs {
+                                if ui
+                                    .selectable_label(active.as_ref() == Some(id), name)
+                                    .clicked()
+                                {
+                                    set = Some(Some(id.clone()));
+                                }
+                            }
+                        });
+                });
+            });
+            if let Some(id) = set {
+                self.set_active_environment(id);
+            }
+            if edit {
+                self.open_environments();
+            }
+        } else if self.project.is_none() {
+            ui.label(
+                RichText::new(s::NO_FOLDER_HTTP)
+                    .small()
+                    .color(p.text_secondary),
+            );
+        } else {
+            ui.label(RichText::new(s::LOADING).small().color(p.text_secondary));
+        }
+
+        // Collections.
+        let collections: Vec<SidebarCollection> = self
+            .project
+            .as_ref()
+            .map(|p| {
+                p.data
+                    .collections
+                    .iter()
+                    .map(|c| {
+                        (
+                            c.id.clone(),
+                            c.name.clone(),
+                            c.requests
+                                .iter()
+                                .map(|r| {
+                                    (r.id.clone(), r.method.as_str().to_owned(), r.name.clone())
+                                })
+                                .collect(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !collections.is_empty() {
+            ui.add_space(4.0);
+            ui.label(heading(s::COLLECTIONS));
+        }
+        for (cid, cname, requests) in collections {
+            let id = ui.make_persistent_id(("collection", &cid));
+            egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true)
+                .show_header(ui, |ui| {
+                    // Menu first: the truncated name then takes only the
+                    // width that is left, so the row never overflows.
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.menu_button("⋯", |ui| {
+                            if ui.button(s::EXPORT).clicked() {
+                                self.export_collection_dialog(&cid, false);
+                                ui.close();
+                            }
+                            if ui.button(s::EXPORT_WITH_SECRETS).clicked() {
+                                self.export_collection_dialog(&cid, true);
+                                ui.close();
+                            }
+                            if ui.button(s::DELETE).clicked() {
+                                self.dialog = Some(Dialog::DeleteCollection(cid.clone()));
+                                ui.close();
+                            }
+                        });
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            ui.label(RichText::new(&cname).strong());
+                        });
+                    });
+                })
+                .body(|ui| {
+                    for (rid, method, name) in &requests {
+                        let open = self.tabs.iter().any(|t| {
+                            matches!(t, Tab::Http(h) if self.active == Some(h.key)
+                                && h.source.as_ref().is_some_and(|s| &s.request == rid))
+                        });
+                        let r = ui.selectable_label(open, format!("{method}  {name}"));
+                        if r.clicked() {
+                            self.open_saved_request(&cid, rid);
+                        }
+                        r.context_menu(|ui| {
+                            if ui.button(s::DELETE).clicked() {
+                                self.dialog = Some(Dialog::DeleteRequest(cid.clone(), rid.clone()));
+                                ui.close();
+                            }
+                        });
+                    }
+                });
+        }
+
+        // Unsaved request tabs.
+        let open: Vec<(TabKey, String)> = self
+            .tabs
+            .iter()
+            .filter_map(|t| match t {
+                Tab::Http(h) if h.source.is_none() => {
+                    Some((h.key, format!("{}  {}", h.def.method.as_str(), h.def.name)))
+                }
+                _ => None,
+            })
+            .collect();
+        if !open.is_empty() {
+            ui.add_space(4.0);
+            ui.label(heading(s::OPEN_REQUESTS));
+            for (key, label) in open {
+                if ui
+                    .selectable_label(self.active == Some(key), label)
+                    .clicked()
+                {
+                    self.active = Some(key);
+                }
+            }
+        }
+        if self.tabs.iter().all(|t| !matches!(t, Tab::Http(_)))
+            && self
+                .project
+                .as_ref()
+                .is_none_or(|p| p.data.collections.is_empty())
+        {
+            ui.label(
+                RichText::new(s::NO_REQUESTS)
+                    .color(p.text_secondary)
+                    .small(),
+            );
+        }
+
+        // History.
+        if !self.history.is_empty() {
+            ui.add_space(4.0);
+            let mut open_index = None;
+            let mut clear = false;
+            egui::CollapsingHeader::new(heading(&format!(
+                "{} ({})",
+                s::HISTORY,
+                self.history.len()
+            )))
+            .id_salt("history")
+            .default_open(false)
+            .show(ui, |ui| {
+                for (i, h) in self.history.iter().enumerate().take(100) {
+                    let status = h.status.map_or_else(|| "ERR".to_owned(), |s| s.to_string());
+                    let label = format!("{status} {} {}", h.request.method.as_str(), h.request.url);
+                    let color = h.status.map_or(p.error, |s| status_color(p, s));
+                    if ui
+                        .selectable_label(false, RichText::new(label).small().color(color))
+                        .on_hover_text(
+                            h.error
+                                .clone()
+                                .unwrap_or_else(|| format!("{} ms", h.duration_ms)),
+                        )
+                        .clicked()
+                    {
+                        open_index = Some(i);
+                    }
+                }
+                if ui.small_button(s::CLEAR_HISTORY).clicked() {
+                    clear = true;
+                }
+            });
+            if let Some(i) = open_index {
+                self.open_history_entry(i);
+            }
+            if clear {
+                self.clear_history();
+            }
         }
     }
 }
+
+/// (id, name, requests as (id, method, name)) for drawing the sidebar.
+type SidebarCollection = (String, String, Vec<(String, String, String)>);
 
 pub fn status_color(p: &theme::Palette, status: u16) -> Color32 {
     match status {

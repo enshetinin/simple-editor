@@ -66,8 +66,8 @@ pub fn run(bin_name: &str) -> ExitCode {
                 &cc.egui_ctx,
                 launch,
                 app::AppOptions {
-                    recovery_root: None,
                     startup_probe,
+                    ..app::AppOptions::default()
                 },
             )))
         }),

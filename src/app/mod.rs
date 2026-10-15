@@ -3,7 +3,9 @@
 
 mod docs;
 pub mod editor_view;
+mod env_view;
 mod find;
+mod http_app;
 mod http_view;
 mod jobs;
 mod recovery;
@@ -19,17 +21,18 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 
 pub use editor_view::EditorViewState;
+pub use env_view::EnvTab;
 pub use find::FindState;
+pub use http_app::{HttpState, HttpTab, ProjectState, RequestPane, ResponsePane, ResponseView};
 use jobs::Jobs;
 use recovery::{RecoveryEvent, RecoveryWorker};
 
 use crate::cli::LaunchArgs;
 use crate::editor::Document;
-use crate::http::{
-    ClientConfig, HttpError, HttpResponse, HttpService, Notify, RequestDraft, RequestId,
-    ValidationError,
-};
-use crate::storage::recovery::{OrphanSession, default_root};
+use crate::http::secrets::{SecretBackend, default_backend};
+use crate::http::{ClientConfig, HttpService, Notify};
+use crate::storage::history::{HistoryEntry, UserState};
+use crate::storage::recovery::OrphanSession;
 use crate::syntax::{HighlightSpans, Lang, SyntaxService};
 use crate::workspace::Workspace;
 
@@ -64,40 +67,10 @@ pub struct DocTab {
     last_edit: Instant,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResponsePane {
-    Body,
-    Headers,
-}
-
-pub struct ResponseView {
-    pub response: HttpResponse,
-    /// Byte ranges of each line of `response.body_text`.
-    pub lines: Vec<Range<usize>>,
-    /// Some line is longer than the view shows.
-    pub has_long_lines: bool,
-    pub pane: ResponsePane,
-}
-
-pub enum HttpState {
-    Idle,
-    Invalid(ValidationError),
-    Sending { id: RequestId, started: Instant },
-    Cancelled,
-    Failed(HttpError),
-    Done(Box<ResponseView>),
-}
-
-pub struct HttpTab {
-    pub key: TabKey,
-    pub title: String,
-    pub draft: RequestDraft,
-    pub state: HttpState,
-}
-
 pub enum Tab {
     Doc(Box<DocTab>),
     Http(Box<HttpTab>),
+    Env(Box<EnvTab>),
 }
 
 impl Tab {
@@ -105,18 +78,24 @@ impl Tab {
         match self {
             Tab::Doc(t) => t.key,
             Tab::Http(t) => t.key,
+            Tab::Env(t) => t.key,
         }
     }
 
     pub fn title(&self) -> String {
         match self {
             Tab::Doc(t) => t.doc.display_name(),
-            Tab::Http(t) => t.title.clone(),
+            Tab::Http(t) => t.def.name.clone(),
+            Tab::Env(_) => strings::ENVIRONMENTS.to_owned(),
         }
     }
 
     pub fn is_dirty(&self) -> bool {
-        matches!(self, Tab::Doc(t) if t.doc.is_dirty())
+        match self {
+            Tab::Doc(t) => t.doc.is_dirty(),
+            Tab::Http(t) => t.is_dirty(),
+            Tab::Env(t) => t.is_dirty(),
+        }
     }
 }
 
@@ -130,7 +109,25 @@ pub enum AfterSave {
 pub enum Dialog {
     CloseTab(TabKey),
     Quit,
-    Conflict { tab: TabKey, then: AfterSave },
+    Conflict {
+        tab: TabKey,
+        then: AfterSave,
+    },
+    /// Choose a collection and name for an unsaved request.
+    SaveRequest {
+        tab: TabKey,
+        collection: Option<String>,
+        new_collection: String,
+        name: String,
+        then: AfterSave,
+    },
+    ImportCurl {
+        text: String,
+        error: Option<String>,
+    },
+    DeleteCollection(String),
+    /// (collection id, request id)
+    DeleteRequest(String, String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,6 +146,14 @@ pub struct SimpleEditorApp {
     recovery: Option<RecoveryWorker>,
     /// Sessions from previous runs with unsaved buffers, awaiting a decision.
     pub orphans: Vec<OrphanSession>,
+    /// Collections, environments and variables of the open folder.
+    pub project: Option<ProjectState>,
+    pub history: Vec<HistoryEntry>,
+    user_state: UserState,
+    data_dir: Option<PathBuf>,
+    secrets: Arc<dyn SecretBackend>,
+    /// Limit for "Send and save to file", in MiB (session setting).
+    pub download_limit_mib: u64,
     pub notices: Vec<Notice>,
     pub dialog: Option<Dialog>,
     allow_close: bool,
@@ -163,11 +168,16 @@ pub struct SimpleEditorApp {
 }
 
 /// Options that tests and tools may change.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct AppOptions {
-    /// Where crash-recovery snapshots go; `None` uses the platform default.
-    pub recovery_root: Option<PathBuf>,
+    /// Where user data (recovery, history, state) goes; `None` uses the
+    /// platform default (or `$SE_DATA_DIR`).
+    pub data_dir: Option<PathBuf>,
     pub startup_probe: Option<Instant>,
+    /// Secret store; `None` uses the OS credential store.
+    pub secrets: Option<Arc<dyn SecretBackend>>,
+    /// HTTP client settings (e.g. extra trusted certificates for tests).
+    pub client: Option<ClientConfig>,
 }
 
 impl SimpleEditorApp {
@@ -177,7 +187,7 @@ impl SimpleEditorApp {
         let notify: Notify = Arc::new(move || repaint_ctx.request_repaint());
 
         let mut notices = Vec::new();
-        let http = match HttpService::new(ClientConfig::default(), notify.clone()) {
+        let http = match HttpService::new(options.client.unwrap_or_default(), notify.clone()) {
             Ok(s) => Some(s),
             Err(e) => {
                 notices.push(Notice {
@@ -187,25 +197,39 @@ impl SimpleEditorApp {
                 None
             }
         };
-        let recovery = match options.recovery_root.or_else(default_root) {
+        let data_dir = options.data_dir.or_else(crate::storage::data_dir);
+        let recovery_root = data_dir.as_ref().map(|d| d.join("recovery"));
+        let recovery = match recovery_root {
             Some(root) => Some(RecoveryWorker::start(&root, notify.clone())),
             None => {
                 notices.push(Notice {
                     is_error: true,
-                    text: "Crash recovery is unavailable: no data directory was found.".to_owned(),
+                    text:
+                        "Crash recovery and history are unavailable: no data directory was found."
+                            .to_owned(),
                 });
                 None
             }
         };
+        let jobs = Jobs::new(notify.clone());
+        if let Some(dir) = &data_dir {
+            jobs.load_user_data(dir.clone());
+        }
         let mut app = Self {
             workspace: Workspace::new(notify.clone()),
             tabs: Vec::new(),
             active: None,
             http,
-            syntax: SyntaxService::new(notify.clone()),
-            jobs: Jobs::new(notify),
+            syntax: SyntaxService::new(notify),
+            jobs,
             recovery,
             orphans: Vec::new(),
+            project: None,
+            history: Vec::new(),
+            user_state: UserState::default(),
+            data_dir,
+            secrets: options.secrets.unwrap_or_else(default_backend),
+            download_limit_mib: crate::http::client::DEFAULT_DOWNLOAD_LIMIT / (1024 * 1024),
             notices,
             dialog: None,
             allow_close: false,
@@ -219,7 +243,7 @@ impl SimpleEditorApp {
             ctx: ctx.clone(),
         };
         if let Some(root) = launch.root {
-            app.workspace.set_root(root);
+            app.open_folder(root);
         }
         for file in launch.files {
             app.open_path(file);
@@ -265,6 +289,20 @@ impl SimpleEditorApp {
         })
     }
 
+    pub fn http_tab(&self, key: TabKey) -> Option<&HttpTab> {
+        self.tabs.iter().find_map(|t| match t {
+            Tab::Http(h) if h.key == key => Some(h.as_ref()),
+            _ => None,
+        })
+    }
+
+    pub fn http_tab_mut(&mut self, key: TabKey) -> Option<&mut HttpTab> {
+        self.tabs.iter_mut().find_map(|t| match t {
+            Tab::Http(h) if h.key == key => Some(h.as_mut()),
+            _ => None,
+        })
+    }
+
     pub fn active_tab(&self) -> Option<&Tab> {
         let key = self.active?;
         self.tabs.iter().find(|t| t.key() == key)
@@ -275,9 +313,18 @@ impl SimpleEditorApp {
     }
 
     pub fn saves_in_flight(&self) -> bool {
-        self.tabs
-            .iter()
-            .any(|t| matches!(t, Tab::Doc(d) if d.saving))
+        self.tabs.iter().any(|t| match t {
+            Tab::Doc(d) => d.saving,
+            Tab::Http(h) => h.saving,
+            Tab::Env(e) => e.saving,
+        })
+    }
+
+    /// Opens a project folder: file tree and `.simpleeditor/` data.
+    pub fn open_folder(&mut self, root: PathBuf) {
+        self.workspace.set_root(root.clone());
+        self.project = Some(ProjectState::loading(root.clone()));
+        self.jobs.load_project(root, self.secrets.clone());
     }
 
     /// Background work results; called every frame before drawing.
@@ -316,76 +363,9 @@ impl SimpleEditorApp {
         self.sync_documents();
     }
 
-    fn poll_http(&mut self) {
-        let Some(http) = self.http.as_mut() else {
-            return;
-        };
-        for event in http.poll() {
-            // Only the latest request of a tab may update it.
-            let tab = self.tabs.iter_mut().find_map(|t| match t {
-                Tab::Http(h)
-                    if matches!(h.state, HttpState::Sending { id, .. } if id == event.id) =>
-                {
-                    Some(h)
-                }
-                _ => None,
-            });
-            if let Some(tab) = tab {
-                tab.state = match event.result {
-                    Ok(response) => HttpState::Done(Box::new(ResponseView::new(response))),
-                    Err(e) => HttpState::Failed(e),
-                };
-            }
-        }
-    }
-
-    // ---- HTTP -------------------------------------------------------------
-
-    pub fn new_request(&mut self) {
-        let key = self.alloc_key();
-        let title = format!("Request {}", self.next_request_number);
-        self.next_request_number += 1;
-        self.tabs.push(Tab::Http(Box::new(HttpTab {
-            key,
-            title,
-            draft: RequestDraft::default(),
-            state: HttpState::Idle,
-        })));
-        self.active = Some(key);
-    }
-
-    pub fn send_request(&mut self, key: TabKey) {
-        let Some(Tab::Http(tab)) = self.tabs.iter_mut().find(|t| t.key() == key) else {
-            return;
-        };
-        let Some(http) = self.http.as_mut() else {
-            return;
-        };
-        if let HttpState::Sending { id, .. } = tab.state {
-            http.cancel(id);
-        }
-        tab.state = match tab.draft.prepare() {
-            Ok(prepared) => HttpState::Sending {
-                id: http.send(prepared),
-                started: Instant::now(),
-            },
-            Err(e) => HttpState::Invalid(e),
-        };
-    }
-
-    pub fn cancel_request(&mut self, key: TabKey) {
-        let Some(Tab::Http(tab)) = self.tabs.iter_mut().find(|t| t.key() == key) else {
-            return;
-        };
-        if let (HttpState::Sending { id, .. }, Some(http)) = (&tab.state, self.http.as_mut()) {
-            http.cancel(*id);
-            tab.state = HttpState::Cancelled;
-        }
-    }
-
     // ---- tabs and quitting -------------------------------------------------
 
-    /// Asks to close a tab; unsaved documents ask for confirmation first.
+    /// Asks to close a tab; unsaved work asks for confirmation first.
     pub fn request_close_tab(&mut self, key: TabKey) {
         let Some(index) = self.tab_index(key) else {
             return;
@@ -404,9 +384,8 @@ impl SimpleEditorApp {
         };
         match &self.tabs[index] {
             Tab::Http(t) => {
-                if let (HttpState::Sending { id, .. }, Some(http)) = (&t.state, self.http.as_mut())
-                {
-                    http.cancel(*id);
+                if let (Some(id), Some(http)) = (t.request_id(), self.http.as_mut()) {
+                    http.cancel(id);
                 }
             }
             Tab::Doc(d) => {
@@ -417,6 +396,7 @@ impl SimpleEditorApp {
                     r.remove(d.key);
                 }
             }
+            Tab::Env(_) => {}
         }
         self.tabs.remove(index);
         if self.active == Some(key) {
@@ -428,7 +408,17 @@ impl SimpleEditorApp {
         }
     }
 
-    /// Saves every modified document; quits once all of them are saved.
+    /// Saves any tab kind; returns false if nothing was started.
+    pub fn save_any(&mut self, key: TabKey, then: AfterSave) -> bool {
+        match self.tabs.iter().find(|t| t.key() == key) {
+            Some(Tab::Doc(_)) => self.save_tab(key, false, false, then),
+            Some(Tab::Http(_)) => self.save_request(key, then),
+            Some(Tab::Env(_)) => self.save_environments(key, then),
+            None => false,
+        }
+    }
+
+    /// Saves everything modified; quits once all saves have finished.
     pub fn save_all_and_quit(&mut self) {
         self.quit_after_saves = true;
         let dirty: Vec<TabKey> = self
@@ -438,7 +428,7 @@ impl SimpleEditorApp {
             .map(Tab::key)
             .collect();
         for key in dirty {
-            if !self.save_tab(key, false, false, AfterSave::Quit) {
+            if !self.save_any(key, AfterSave::Quit) {
                 self.quit_after_saves = false;
                 return;
             }
@@ -449,6 +439,23 @@ impl SimpleEditorApp {
     fn maybe_quit_after_saves(&mut self) {
         if self.quit_after_saves && !self.any_dirty() && !self.saves_in_flight() {
             self.quit_now();
+        }
+    }
+
+    fn after_save(&mut self, key: TabKey, then: AfterSave) {
+        let still_dirty = self
+            .tabs
+            .iter()
+            .find(|t| t.key() == key)
+            .is_some_and(Tab::is_dirty);
+        match then {
+            AfterSave::Nothing => {}
+            AfterSave::CloseTab(k) => {
+                if !still_dirty {
+                    self.close_tab_now(k);
+                }
+            }
+            AfterSave::Quit => self.maybe_quit_after_saves(),
         }
     }
 
@@ -480,38 +487,6 @@ impl SimpleEditorApp {
             r.finish();
         }
     }
-}
-
-impl ResponseView {
-    fn new(response: HttpResponse) -> Self {
-        let lines = response
-            .body_text
-            .as_deref()
-            .map(line_ranges)
-            .unwrap_or_default();
-        let has_long_lines = lines.iter().any(|r| r.len() > http_view::MAX_LINE_CHARS);
-        Self {
-            response,
-            lines,
-            has_long_lines,
-            pane: ResponsePane::Body,
-        }
-    }
-}
-
-fn line_ranges(text: &str) -> Vec<Range<usize>> {
-    let mut ranges = Vec::new();
-    let mut start = 0;
-    for (i, b) in text.bytes().enumerate() {
-        if b == b'\n' {
-            ranges.push(start..i);
-            start = i + 1;
-        }
-    }
-    if start < text.len() || ranges.is_empty() {
-        ranges.push(start..text.len());
-    }
-    ranges
 }
 
 impl eframe::App for SimpleEditorApp {

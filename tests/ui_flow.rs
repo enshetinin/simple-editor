@@ -4,7 +4,10 @@
 
 mod support;
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use simpleeditor::http::secrets::MemoryBackend;
 
 use eframe::egui::{self, Event, Id, Key, Modifiers, RawInput};
 use simpleeditor::app::{AppOptions, Dialog, HttpState, SimpleEditorApp, Tab};
@@ -30,13 +33,15 @@ fn frame(ctx: &egui::Context, app: &mut SimpleEditorApp, events: Vec<Event>) {
 /// user's data directory.
 fn options() -> AppOptions {
     let root = std::env::temp_dir().join(format!(
-        "se-test-recovery-{}-{}",
+        "se-test-data-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     AppOptions {
-        recovery_root: Some(root),
-        startup_probe: None,
+        data_dir: Some(root),
+        // Never touch the real Keychain / Credential Manager from tests.
+        secrets: Some(Arc::new(MemoryBackend::default())),
+        ..AppOptions::default()
     }
 }
 
@@ -149,7 +154,7 @@ fn edit_save_and_send_request_through_the_ui() {
     app.new_request();
     let http_key = app.active.unwrap();
     if let Some(Tab::Http(t)) = app.tabs.iter_mut().find(|t| t.key() == http_key) {
-        t.draft.url = server.url("/json");
+        t.def.url = server.url("/json");
     }
     app.send_request(http_key);
     frame(&ctx, &mut app, vec![]);
@@ -193,7 +198,7 @@ fn cancel_from_ui_state_ignores_late_results() {
     app.new_request();
     let key = app.active.unwrap();
     if let Some(Tab::Http(t)) = app.tabs.iter_mut().find(|t| t.key() == key) {
-        t.draft.url = server.url("/delay");
+        t.def.url = server.url("/delay");
     }
     app.send_request(key);
     frame(&ctx, &mut app, vec![]);
@@ -214,7 +219,7 @@ fn invalid_url_blocks_sending_and_names_the_field() {
     app.new_request();
     let key = app.active.unwrap();
     if let Some(Tab::Http(t)) = app.tabs.iter_mut().find(|t| t.key() == key) {
-        t.draft.url = "ftp://example.com".to_owned();
+        t.def.url = "ftp://example.com".to_owned();
     }
     app.send_request(key);
     let Some(Tab::Http(h)) = app.tabs.iter().find(|t| t.key() == key) else {
@@ -223,7 +228,8 @@ fn invalid_url_blocks_sending_and_names_the_field() {
     let HttpState::Invalid(e) = &h.state else {
         panic!("expected validation error")
     };
-    assert!(e.to_string().starts_with("URL:"));
+    assert_eq!(e[0].field, "URL");
+    assert!(e[0].message.contains("ftp"));
     frame(&ctx, &mut app, vec![]);
 }
 
@@ -395,7 +401,7 @@ fn unsaved_changes_survive_a_crash_and_restore_without_touching_the_file() {
     let (mut app, _dir, file) = open_doc(&ctx, "original\n", "notes.txt", opts.clone());
     frame(&ctx, &mut app, vec![Event::Text("recovered ".into())]);
     // Wait until the snapshot is written (after the idle delay).
-    let root = opts.recovery_root.clone().unwrap();
+    let root = opts.data_dir.clone().unwrap().join("recovery");
     let has_snapshot = |root: &std::path::Path| {
         std::fs::read_dir(root)
             .into_iter()

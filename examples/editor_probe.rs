@@ -313,8 +313,48 @@ fn probe_disk(name: &str, text: &str) {
     println!("| {name} | {} | {} |", ms(open), ms(save));
 }
 
+fn probe_json_response() {
+    // ~5 MiB JSON array of objects (the preview limit).
+    let mut json = String::from("[");
+    let mut i = 0;
+    while json.len() < 5 * MIB - 200 {
+        if i > 0 {
+            json.push(',');
+        }
+        json.push_str(&format!(
+            r#"{{"id":{i},"name":"user {i} café","tags":["a","b"],"active":true,"score":{}.5}}"#,
+            i % 97
+        ));
+        i += 1;
+    }
+    json.push(']');
+    let t = Instant::now();
+    simpleeditor::http::json::validate(&json).expect("valid");
+    let validate = t.elapsed();
+    let t = Instant::now();
+    let pretty = simpleeditor::http::json::pretty(&json);
+    let format = t.elapsed();
+    let t = Instant::now();
+    let lines = simpleeditor::http::TextLines::new(pretty);
+    let split = t.elapsed();
+    println!(
+        "| {:.1} MiB → {:.1} MiB pretty, {} lines | {} | {} | {} |",
+        json.len() as f64 / MIB as f64,
+        lines.text.len() as f64 / MIB as f64,
+        lines.lines.len(),
+        ms(validate),
+        ms(format),
+        ms(split)
+    );
+}
+
 fn main() {
     let big = std::env::args().any(|a| a == "--100mib");
+    println!("## HTTP response processing on the worker (ms)");
+    println!("| body | validate | pretty | split lines |");
+    println!("|---|---|---|---|");
+    probe_json_response();
+    println!();
     let mut corpora: Vec<(&str, String)> = vec![
         ("code 1 KiB", corpus_code(1024)),
         ("code 1 MiB", corpus_code(MIB)),

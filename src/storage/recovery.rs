@@ -119,39 +119,9 @@ fn remove_if_exists(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Default recovery root in the platform's local data directory, or
-/// `$SE_DATA_DIR/recovery` when set (tests, portable use).
-///
-/// - macOS: `~/Library/Application Support/SimpleEditor/recovery`
-/// - Windows: `%LOCALAPPDATA%\SimpleEditor\recovery`
-/// - other: `$XDG_DATA_HOME` or `~/.local/share`, then `SimpleEditor/recovery`
+/// Default recovery root: `<data dir>/recovery` (see [`super::data_dir`]).
 pub fn default_root() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("SE_DATA_DIR") {
-        return Some(PathBuf::from(dir).join("recovery"));
-    }
-    data_dir().map(|d| d.join("SimpleEditor").join("recovery"))
-}
-
-fn non_empty_env(name: &str) -> Option<PathBuf> {
-    std::env::var_os(name)
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-}
-
-#[cfg(target_os = "macos")]
-fn data_dir() -> Option<PathBuf> {
-    non_empty_env("HOME").map(|h| h.join("Library").join("Application Support"))
-}
-
-#[cfg(windows)]
-fn data_dir() -> Option<PathBuf> {
-    non_empty_env("LOCALAPPDATA")
-}
-
-#[cfg(not(any(target_os = "macos", windows)))]
-fn data_dir() -> Option<PathBuf> {
-    non_empty_env("XDG_DATA_HOME")
-        .or_else(|| non_empty_env("HOME").map(|h| h.join(".local").join("share")))
+    super::data_dir().map(|d| d.join("recovery"))
 }
 
 impl RecoverySession {

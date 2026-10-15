@@ -1,8 +1,7 @@
-use std::fmt;
-
 use reqwest::Url;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
 pub enum Method {
     Get,
     Post,
@@ -36,6 +35,12 @@ impl Method {
         }
     }
 
+    pub fn parse(s: &str) -> Option<Method> {
+        Method::ALL
+            .into_iter()
+            .find(|m| m.as_str().eq_ignore_ascii_case(s))
+    }
+
     pub(crate) fn to_reqwest(self) -> reqwest::Method {
         match self {
             Method::Get => reqwest::Method::GET,
@@ -49,141 +54,54 @@ impl Method {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BodyKind {
-    Text,
-    Json,
-}
-
-impl BodyKind {
-    pub fn label(self) -> &'static str {
-        match self {
-            BodyKind::Text => "Text",
-            BodyKind::Json => "JSON",
+/// Validates an expanded URL: absolute, `http`/`https`, with a host.
+pub fn parse_http_url(raw: &str) -> Result<Url, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("enter a URL such as http://localhost:8080/".to_owned());
+    }
+    let url = Url::parse(raw).map_err(|e| match e {
+        url::ParseError::RelativeUrlWithoutBase => {
+            "add the scheme, e.g. http:// or https://".to_owned()
+        }
+        other => other.to_string(),
+    })?;
+    match url.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(format!(
+                "scheme \"{other}\" is not supported; use http:// or https://"
+            ));
         }
     }
-
-    pub fn content_type(self) -> &'static str {
-        match self {
-            BodyKind::Text => "text/plain; charset=utf-8",
-            BodyKind::Json => "application/json",
-        }
+    if url.host_str().is_none_or(str::is_empty) {
+        return Err("the host is missing".to_owned());
     }
-}
-
-/// What the user typed. Nothing here is trusted or interpreted as a command.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RequestDraft {
-    pub method: Method,
-    pub url: String,
-    pub body: String,
-    pub body_kind: BodyKind,
-}
-
-impl Default for RequestDraft {
-    fn default() -> Self {
-        Self {
-            method: Method::Get,
-            url: String::new(),
-            body: String::new(),
-            body_kind: BodyKind::Json,
-        }
-    }
-}
-
-/// A validated request, ready to send.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PreparedRequest {
-    pub method: Method,
-    pub url: Url,
-    pub body: Option<(BodyKind, String)>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ValidationError {
-    EmptyUrl,
-    InvalidUrl(String),
-    UnsupportedScheme(String),
-    MissingHost,
-}
-
-impl fmt::Display for ValidationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ValidationError::EmptyUrl => {
-                write!(f, "URL: enter a URL such as http://localhost:8080/")
-            }
-            ValidationError::InvalidUrl(e) => write!(f, "URL: {e}"),
-            ValidationError::UnsupportedScheme(s) => {
-                write!(
-                    f,
-                    "URL: scheme \"{s}\" is not supported; use http:// or https://"
-                )
-            }
-            ValidationError::MissingHost => write!(f, "URL: the host is missing"),
-        }
-    }
-}
-
-impl RequestDraft {
-    pub fn prepare(&self) -> Result<PreparedRequest, ValidationError> {
-        let raw = self.url.trim();
-        if raw.is_empty() {
-            return Err(ValidationError::EmptyUrl);
-        }
-        let url = Url::parse(raw).map_err(|e| match e {
-            url::ParseError::RelativeUrlWithoutBase => {
-                ValidationError::InvalidUrl("add the scheme, e.g. http:// or https://".to_owned())
-            }
-            other => ValidationError::InvalidUrl(other.to_string()),
-        })?;
-        match url.scheme() {
-            "http" | "https" => {}
-            other => return Err(ValidationError::UnsupportedScheme(other.to_owned())),
-        }
-        if url.host_str().is_none_or(str::is_empty) {
-            return Err(ValidationError::MissingHost);
-        }
-        let body = (!self.body.is_empty()).then(|| (self.body_kind, self.body.clone()));
-        Ok(PreparedRequest {
-            method: self.method,
-            url,
-            body,
-        })
-    }
+    Ok(url)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn draft(url: &str) -> RequestDraft {
-        RequestDraft {
-            url: url.to_owned(),
-            ..RequestDraft::default()
-        }
-    }
-
     #[test]
     fn validates_scheme_and_host() {
-        assert_eq!(draft("  ").prepare(), Err(ValidationError::EmptyUrl));
-        assert!(matches!(
-            draft("localhost:8080/x").prepare(),
-            Err(ValidationError::UnsupportedScheme(_))
-        ));
-        assert!(matches!(
-            draft("/relative").prepare(),
-            Err(ValidationError::InvalidUrl(_))
-        ));
-        assert!(matches!(
-            draft("file:///etc/passwd").prepare(),
-            Err(ValidationError::UnsupportedScheme(_))
-        ));
+        assert!(parse_http_url("  ").is_err());
+        assert!(
+            parse_http_url("localhost:8080/x")
+                .unwrap_err()
+                .contains("scheme")
+        );
+        assert!(parse_http_url("/relative").unwrap_err().contains("scheme"));
+        assert!(
+            parse_http_url("file:///etc/passwd")
+                .unwrap_err()
+                .contains("file")
+        );
         // Shell metacharacters are just URL characters, never executed.
-        let ok = draft("http://127.0.0.1:1/a?q=$(rm -rf ~)&x=`id`")
-            .prepare()
-            .unwrap();
-        assert_eq!(ok.url.host_str(), Some("127.0.0.1"));
-        assert!(ok.body.is_none());
+        let ok = parse_http_url("http://127.0.0.1:1/a?q=$(rm -rf ~)&x=`id`").unwrap();
+        assert_eq!(ok.host_str(), Some("127.0.0.1"));
+        assert_eq!(Method::parse("patch"), Some(Method::Patch));
+        assert_eq!(Method::parse("TRACE"), None);
     }
 }
